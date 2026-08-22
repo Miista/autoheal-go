@@ -1,0 +1,427 @@
+// autoheal-go is a from-scratch Go port of willfarrell/docker-autoheal
+// (https://github.com/willfarrell/docker-autoheal, docker-entrypoint, 180
+// lines of POSIX sh). Same env-var interface, same core loop semantics —
+// verified line-by-line against the real upstream script, not a summary of
+// it. The one behavioral addition is crash-loop awareness (see strikes.go):
+// upstream restarts an unhealthy container forever with no memory of how
+// many times it's already tried, which is fine for a one-off fix but gives
+// no signal when restarting isn't actually helping. Docker's own
+// RestartCount does NOT cover this — it only increments on automatic
+// restart-policy restarts (container process exit), not on the manual
+// `docker restart` API call autoheal (and this port) uses, confirmed
+// against moby/moby's daemon/restart.go and daemon/monitor.go. So the
+// strike count has to be our own in-memory state, which is also why this
+// needed to be a real long-running process rather than a stateless POSIX
+// sh loop like upstream — sh has no persistent variables across a `while
+// true` loop's subshells without resorting to a state file on disk, which
+// was deliberately ruled out (see strikes.go's doc comment for why).
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+)
+
+type config struct {
+	DockerSock                string
+	CurlTimeout               time.Duration
+	WebhookURL                string
+	WebhookJSONKey            string
+	AppriseURL                string
+	PostRestartScript         string
+	ContainerLabel            string
+	StartPeriod               time.Duration
+	Interval                  time.Duration
+	DefaultStopTimeout        int
+	OnlyMonitorRunning        bool
+	CrashLoopStrikeThreshold  int
+}
+
+func loadConfig() config {
+	return config{
+		DockerSock:               getEnv("DOCKER_SOCK", "/var/run/docker.sock"),
+		CurlTimeout:              time.Duration(getEnvInt("CURL_TIMEOUT", 30)) * time.Second,
+		WebhookURL:               os.Getenv("WEBHOOK_URL"),
+		WebhookJSONKey:           getEnv("WEBHOOK_JSON_KEY", "text"),
+		AppriseURL:               os.Getenv("APPRISE_URL"),
+		PostRestartScript:        os.Getenv("POST_RESTART_SCRIPT"),
+		ContainerLabel:           getEnv("AUTOHEAL_CONTAINER_LABEL", "autoheal"),
+		StartPeriod:              time.Duration(getEnvInt("AUTOHEAL_START_PERIOD", 0)) * time.Second,
+		Interval:                 time.Duration(getEnvInt("AUTOHEAL_INTERVAL", 5)) * time.Second,
+		DefaultStopTimeout:       getEnvInt("AUTOHEAL_DEFAULT_STOP_TIMEOUT", 10),
+		OnlyMonitorRunning:       getEnv("AUTOHEAL_ONLY_MONITOR_RUNNING", "false") == "true",
+		CrashLoopStrikeThreshold: getEnvInt("AUTOHEAL_CRASHLOOP_STRIKES", 3),
+	}
+}
+
+func getEnv(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return def
+}
+
+func getEnvInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Printf("invalid int for %s=%q, using default %d", key, v, def)
+		return def
+	}
+	return n
+}
+
+// dockerClient talks to the Docker Engine API the same way upstream's
+// docker_curl() does: over the Unix socket by default, or a TCP endpoint if
+// DOCKER_SOCK is set to a tcp://... URL. TLS (tcps://) is intentionally not
+// ported — it was never used in this deployment and upstream's cert paths
+// are hardcoded to /certs/*, not something worth carrying forward blind.
+type dockerClient struct {
+	http     *http.Client
+	endpoint string
+}
+
+func newDockerClient(cfg config) (*dockerClient, error) {
+	switch {
+	case strings.HasPrefix(cfg.DockerSock, "tcp://"):
+		return &dockerClient{
+			http:     &http.Client{Timeout: cfg.CurlTimeout},
+			endpoint: strings.Replace(cfg.DockerSock, "tcp://", "http://", 1),
+		}, nil
+	case strings.HasPrefix(cfg.DockerSock, "tcps://"):
+		return nil, fmt.Errorf("tcps:// (TLS) is not supported by this port — only used by upstream for a cert setup this deployment never had")
+	default:
+		if _, err := os.Stat(cfg.DockerSock); err != nil {
+			return nil, fmt.Errorf("unix socket %s is not available: %w", cfg.DockerSock, err)
+		}
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", cfg.DockerSock)
+			},
+		}
+		return &dockerClient{
+			http:     &http.Client{Transport: transport, Timeout: cfg.CurlTimeout},
+			endpoint: "http://localhost",
+		}, nil
+	}
+}
+
+type containerSummary struct {
+	ID     string            `json:"Id"`
+	Names  []string          `json:"Names"`
+	State  string            `json:"State"`
+	Labels map[string]string `json:"Labels"`
+}
+
+// listUnhealthy mirrors get_container_info(): server-side filtered by
+// health=unhealthy, plus the autoheal label (unless set to "all"), plus
+// status=running if AUTOHEAL_ONLY_MONITOR_RUNNING is set.
+func (d *dockerClient) listUnhealthy(cfg config) ([]containerSummary, error) {
+	filters := map[string][]string{"health": {"unhealthy"}}
+	if cfg.ContainerLabel != "all" {
+		filters["label"] = []string{cfg.ContainerLabel + "=true"}
+	}
+	if cfg.OnlyMonitorRunning {
+		filters["status"] = []string{"running"}
+	}
+	filterJSON, err := json.Marshal(filters)
+	if err != nil {
+		return nil, err
+	}
+
+	url := fmt.Sprintf("%s/containers/json?filters=%s", d.endpoint, urlQueryEscape(string(filterJSON)))
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("docker API returned %d listing containers", resp.StatusCode)
+	}
+	var containers []containerSummary
+	if err := json.NewDecoder(resp.Body).Decode(&containers); err != nil {
+		return nil, err
+	}
+	return containers, nil
+}
+
+// isHealthy checks a single container's CURRENT health status directly,
+// used only for strike-clearing decisions (see strikes.go's doc comment).
+// Deliberately distinct from "absent from the unhealthy list" — a
+// restarting container passes through Docker's "starting" health state
+// (during health-start-period) where it's neither healthy nor unhealthy,
+// and briefly disappears from the unhealthy-filtered list as a result.
+// Treating that as recovery would silently reset the strike count on every
+// single restart cycle for a container whose healthcheck has any
+// start-period at all — confirmed live: a test container with a 1s
+// start-period never crossed a strikes=2 threshold despite 5+ consecutive
+// real restarts, because every other poll caught it mid-"starting" and
+// wiped its count back to zero before the next unhealthy poll could
+// increment it past 1.
+func (d *dockerClient) isHealthy(containerID string) (bool, error) {
+	url := fmt.Sprintf("%s/containers/%s/json", d.endpoint, containerID)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		// Container is gone entirely — not "healthy", but also not
+		// something to keep tracking; caller treats this as clearable.
+		return true, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("docker API returned %d inspecting %s", resp.StatusCode, containerID)
+	}
+	var detail struct {
+		State struct {
+			Health *struct {
+				Status string `json:"Status"`
+			} `json:"Health"`
+		} `json:"State"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+		return false, err
+	}
+	if detail.State.Health == nil {
+		// No healthcheck configured (shouldn't happen for anything we're
+		// tracking, since we only ever strike containers the unhealthy
+		// filter matched, which requires a healthcheck to exist) — treat
+		// as not-recovered rather than guess.
+		return false, nil
+	}
+	return detail.State.Health.Status == "healthy", nil
+}
+
+// restart mirrors restart_container(): POST /containers/{id}/restart?t=timeout.
+func (d *dockerClient) restart(containerID string, timeoutSeconds int) error {
+	url := fmt.Sprintf("%s/containers/%s/restart?t=%d", d.endpoint, containerID, timeoutSeconds)
+	req, err := http.NewRequest(http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("docker API returned %d restarting %s", resp.StatusCode, containerID)
+	}
+	return nil
+}
+
+func urlQueryEscape(s string) string {
+	// net/url.QueryEscape would also do, but avoids importing net/url just
+	// for this one call given http.NewRequest already needs it internally —
+	// kept explicit for clarity that this is escaping a JSON blob into a
+	// query string, exactly like upstream's inline sed/curl composition.
+	q := make([]byte, 0, len(s)*3)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			q = append(q, c)
+		} else {
+			q = append(q, '%', hexDigit(c>>4), hexDigit(c&0xf))
+		}
+	}
+	return string(q)
+}
+
+func hexDigit(b byte) byte {
+	if b < 10 {
+		return '0' + b
+	}
+	return 'a' + (b - 10)
+}
+
+func main() {
+	cfg := loadConfig()
+	log.Printf("AUTOHEAL_CONTAINER_LABEL=%s", cfg.ContainerLabel)
+	log.Printf("AUTOHEAL_START_PERIOD=%s", cfg.StartPeriod)
+	log.Printf("AUTOHEAL_INTERVAL=%s", cfg.Interval)
+	log.Printf("AUTOHEAL_DEFAULT_STOP_TIMEOUT=%d", cfg.DefaultStopTimeout)
+	log.Printf("AUTOHEAL_ONLY_MONITOR_RUNNING=%v", cfg.OnlyMonitorRunning)
+	log.Printf("AUTOHEAL_CRASHLOOP_STRIKES=%d", cfg.CrashLoopStrikeThreshold)
+
+	client, err := newDockerClient(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	if cfg.StartPeriod > 0 {
+		log.Printf("Monitoring containers for unhealthy status in %s", cfg.StartPeriod)
+		select {
+		case <-time.After(cfg.StartPeriod):
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	strikes := newStrikeTracker(cfg.CrashLoopStrikeThreshold)
+
+	ticker := time.NewTicker(cfg.Interval)
+	defer ticker.Stop()
+	for {
+		runOnce(client, cfg, strikes)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func runOnce(client *dockerClient, cfg config, strikes *strikeTracker) {
+	containers, err := client.listUnhealthy(cfg)
+	if err != nil {
+		log.Printf("error listing unhealthy containers: %v", err)
+		return
+	}
+
+	seenUnhealthy := make(map[string]bool, len(containers))
+
+	for _, c := range containers {
+		if cfg.ContainerLabel != "all" && c.Labels["autoheal"] == "False" {
+			continue
+		}
+		if len(c.Names) == 0 {
+			log.Printf("container %s has no name, which implies it does not exist - don't restart", shortID(c.ID))
+			continue
+		}
+		name := strings.TrimPrefix(c.Names[0], "/")
+		shortIDStr := shortID(c.ID)
+		seenUnhealthy[c.ID] = true
+
+		if c.State == "restarting" {
+			log.Printf("Container %s (%s) found to be restarting - don't restart", name, shortIDStr)
+			continue
+		}
+
+		// Once confirmed crash-looping, further blind restarts aren't
+		// helping — stop attempting them and just keep the container
+		// flagged for a human. Still counted as "seen unhealthy" above so
+		// its strike state isn't cleared out from under it while we wait.
+		if strikes.isGivenUp(c.ID) {
+			continue
+		}
+
+		timeout := cfg.DefaultStopTimeout
+		if v, ok := c.Labels["autoheal.stop.timeout"]; ok {
+			if n, err := strconv.Atoi(v); err == nil {
+				timeout = n
+			}
+		}
+
+		log.Printf("Container %s (%s) found to be unhealthy - Restarting container now with %ds timeout", name, shortIDStr, timeout)
+		if err := client.restart(c.ID, timeout); err != nil {
+			log.Printf("Restarting container %s failed: %v", shortIDStr, err)
+			go notify(cfg, fmt.Sprintf("Container %s (%s) found to be unhealthy. Failed to restart the container!", name, shortIDStr))
+			continue
+		}
+
+		go notify(cfg, fmt.Sprintf("Container %s (%s) found to be unhealthy. Successfully restarted the container!", name, shortIDStr))
+		go runPostRestartScript(cfg, name, shortIDStr, c.State, timeout)
+
+		// Crash-loop tracking: only increments when unhealthy AND we just
+		// restarted it — a container that's unhealthy but "restarting"
+		// (skipped above) or that fails the restart call itself doesn't
+		// count as a strike here, since we didn't successfully complete a
+		// heal attempt for it.
+		if crossed, count := strikes.recordRestart(c.ID); crossed {
+			go notify(cfg, fmt.Sprintf("Container %s (%s) has been unhealthy and restarted %d times in a row without recovering — this looks like a crash loop, not a transient issue. Giving up on further automatic restarts; needs manual attention.", name, shortIDStr, count))
+		}
+	}
+
+	// Clear strikes only for tracked containers confirmed genuinely
+	// healthy, not merely absent from the unhealthy-filtered list — a
+	// restarting container passes through Docker's "starting" health state
+	// (during health-start-period), which drops it out of that list
+	// without it having actually recovered. Confirmed live: a container
+	// with any health-start-period at all would otherwise have its strike
+	// count wiped on every other poll, before it could ever reach a
+	// threshold — see isHealthy()'s doc comment for the full story.
+	for id := range strikes.tracked() {
+		if seenUnhealthy[id] {
+			continue
+		}
+		healthy, err := client.isHealthy(id)
+		if err != nil {
+			log.Printf("checking health of %s for strike-clear: %v", shortID(id), err)
+			continue
+		}
+		if healthy {
+			strikes.clear(id)
+		}
+	}
+}
+
+func shortID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
+}
+
+func notify(cfg config, text string) {
+	log.Printf("notify: %s", text)
+	if cfg.WebhookURL != "" {
+		payload, _ := json.Marshal(map[string]string{cfg.WebhookJSONKey: text})
+		postJSON(cfg.WebhookURL, payload)
+	}
+	if cfg.AppriseURL != "" {
+		payload, _ := json.Marshal(map[string]string{"title": "Autoheal", "body": text})
+		postJSON(cfg.AppriseURL, payload)
+	}
+}
+
+func postJSON(url string, payload []byte) {
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(string(payload)))
+	if err != nil {
+		log.Printf("notify: building request to %s: %v", url, err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("notify: posting to %s: %v", url, err)
+		return
+	}
+	defer resp.Body.Close()
+}
+
+func runPostRestartScript(cfg config, name, shortIDStr, state string, timeout int) {
+	if cfg.PostRestartScript == "" {
+		return
+	}
+	cmd := exec.Command(cfg.PostRestartScript, name, shortIDStr, state, strconv.Itoa(timeout))
+	if err := cmd.Run(); err != nil {
+		log.Printf("post-restart script failed: %v", err)
+	}
+}
