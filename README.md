@@ -135,10 +135,19 @@ raw size (~6.2 MB here vs. ~4 MB for `willfarrell/autoheal:1.2.0`; Alpine
 ## Testing
 
 ```sh
-go test ./...          # unit tests: strike-tracking logic
+go test ./... -cover   # unit tests: strike-tracking + runOnce decision logic
 hack/e2e.sh             # integration: builds the real image, runs it as a
                         # real container against a real controllable target
 ```
+
+`runOnce` (the restart/strike/give-up/clear decision logic) is unit-tested
+against a scripted `fakeDockerAPI` (`main_test.go`) — no real daemon needed
+— covering things like "an unhealthy container is restarted," "a failed
+restart doesn't count as a strike," "crossing the threshold stops further
+restarts," and "a given-up container is still polled and recovers on
+relapse." `dockerClient`'s actual HTTP-over-socket calls and `main`'s wiring
+are thin enough that they're left to `hack/e2e.sh` against a real daemon
+instead of mocking the Docker API's wire format.
 
 `hack/e2e.sh` needs Docker and covers, against the actual containerized
 binary (not in-process function calls):

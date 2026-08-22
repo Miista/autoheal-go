@@ -87,6 +87,18 @@ func getEnvInt(log zerolog.Logger, key string, def int) int {
 	return n
 }
 
+// dockerAPI is the slice of the Docker Engine API runOnce needs. It exists so
+// runOnce's restart/strike/give-up/clear decision logic can be unit-tested
+// against a scripted fake — no real daemon, no container — the same way
+// watchkeep's internal/engine tests a fakeDocker instead of hitting a real
+// socket. *dockerClient below is the real implementation; tests use a fake
+// satisfying this interface instead.
+type dockerAPI interface {
+	listUnhealthy(cfg config) ([]containerSummary, error)
+	restart(containerID string, timeoutSeconds int) error
+	isHealthy(containerID string) (bool, error)
+}
+
 // dockerClient talks to the Docker Engine API the same way upstream's
 // docker_curl() does: over the Unix socket by default, or a TCP endpoint if
 // DOCKER_SOCK is set to a tcp://... URL. TLS (tcps://) is intentionally not
@@ -96,6 +108,8 @@ type dockerClient struct {
 	http     *http.Client
 	endpoint string
 }
+
+var _ dockerAPI = (*dockerClient)(nil)
 
 func newDockerClient(cfg config) (*dockerClient, error) {
 	switch {
@@ -299,7 +313,7 @@ func main() {
 	}
 }
 
-func runOnce(log zerolog.Logger, client *dockerClient, cfg config, strikes *strikeTracker) {
+func runOnce(log zerolog.Logger, client dockerAPI, cfg config, strikes *strikeTracker) {
 	containers, err := client.listUnhealthy(cfg)
 	if err != nil {
 		log.Error().Err(err).Msg("Couldn't ask Docker which containers are unhealthy — will try again next cycle")
