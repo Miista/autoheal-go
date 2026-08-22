@@ -11,8 +11,8 @@ defaults, same restart/notify/post-restart-script flow.
 
 ## Drop-in compatibility
 
-Verified against both `willfarrell/autoheal:1.2.0` (the version actually
-deployed on optiplex at the time of writing) and `:latest` (which added
+Verified against both `willfarrell/autoheal:1.2.0` (a widely deployed
+stable tag) and `:latest` (which added
 webhook/apprise/post-restart-script/only-monitor-running — 1.2.0 predates
 all of them). This port targets `:latest`'s feature set but is a safe
 drop-in for a 1.2.0 deployment: every env var 1.2.0 reads
@@ -24,9 +24,10 @@ an existing 1.2.0-style setup (same `docker.sock` mount, same restart
 policy, no new required config).
 
 Two cosmetic differences, neither functional:
-- Log line timestamp format differs (`log.Printf`'s default vs. upstream's
-  `DD-MM-YYYY HH:MM:SS`) — nothing in this fleet parses autoheal's log
-  lines today, confirmed no Gatus/alerting rule depends on the format.
+- Log line timestamp format differs (zerolog's `ConsoleWriter` default vs.
+  upstream's `DD-MM-YYYY HH:MM:SS`) — this only matters if something
+  parses autoheal's log lines by format, which is unusual for a container
+  log consumer.
 - The "container has no name" skip case is detected differently
   (`len(Names) == 0` here vs. upstream's string-compare against the
   literal `"null"` its `jq` pipeline produces) — same underlying Docker
@@ -116,8 +117,8 @@ already logged.
 `FROM scratch` has no `/usr/share/zoneinfo`. The binary embeds Go's
 `time/tzdata` package, so setting `-e TZ=Europe/Stockholm` (or any IANA
 zone name) resolves correctly and affects log timestamps. Without `TZ` set,
-logs are in UTC — same as most `FROM scratch` tools in this fleet (see the
-Gatus wiki page for the same gotcha).
+logs are in UTC — a common gotcha for `FROM scratch` tools generally (e.g.
+TwiN/gatus has the same behavior for the same reason).
 
 ## Building
 

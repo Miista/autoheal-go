@@ -89,10 +89,10 @@ func getEnvInt(log zerolog.Logger, key string, def int) int {
 
 // dockerAPI is the slice of the Docker Engine API runOnce needs. It exists so
 // runOnce's restart/strike/give-up/clear decision logic can be unit-tested
-// against a scripted fake — no real daemon, no container — the same way
-// watchkeep's internal/engine tests a fakeDocker instead of hitting a real
-// socket. *dockerClient below is the real implementation; tests use a fake
-// satisfying this interface instead.
+// against a scripted fake — no real daemon, no container, and no mocking
+// library, just a struct satisfying this interface. *dockerClient below is
+// the real implementation; tests use a fake satisfying this interface
+// instead.
 type dockerAPI interface {
 	listUnhealthy(cfg config) ([]containerSummary, error)
 	restart(containerID string, timeoutSeconds int) error

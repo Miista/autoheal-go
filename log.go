@@ -7,10 +7,9 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// newLogger builds the process-wide zerolog.Logger using ConsoleWriter — the
-// same colored, human-readable format used elsewhere in this fleet (reaparr,
-// diun): "TIME | LEVEL | message key=value ...". Level is configurable via
-// LOG_LEVEL.
+// newLogger builds the process-wide zerolog.Logger using ConsoleWriter — a
+// colored, human-readable format ("TIME LEVEL message key=value ...")
+// rather than a raw structured dump. Level is configurable via LOG_LEVEL.
 //
 // Log call sites are expected to build a complete, readable sentence and
 // pass it as the message with no additional fields; ConsoleWriter appends

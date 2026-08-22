@@ -8,8 +8,7 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// fakeDockerAPI is a scripted Docker seam, matching watchkeep's fakeDocker
-// convention (internal/engine/fake_test.go) — a plain struct with recorded
+// fakeDockerAPI is a scripted Docker seam: a plain struct with recorded
 // calls and injectable errors, no mocking library.
 type fakeDockerAPI struct {
 	containers []containerSummary
