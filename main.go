@@ -21,7 +21,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -32,6 +31,8 @@ import (
 	"syscall"
 	"time"
 	_ "time/tzdata" // FROM scratch has no /usr/share/zoneinfo; embed it so TZ works for log timestamps
+
+	"github.com/rs/zerolog"
 )
 
 type config struct {
@@ -49,20 +50,20 @@ type config struct {
 	CrashLoopStrikeThreshold  int
 }
 
-func loadConfig() config {
+func loadConfig(log zerolog.Logger) config {
 	return config{
 		DockerSock:               getEnv("DOCKER_SOCK", "/var/run/docker.sock"),
-		CurlTimeout:              time.Duration(getEnvInt("CURL_TIMEOUT", 30)) * time.Second,
+		CurlTimeout:              time.Duration(getEnvInt(log, "CURL_TIMEOUT", 30)) * time.Second,
 		WebhookURL:               os.Getenv("WEBHOOK_URL"),
 		WebhookJSONKey:           getEnv("WEBHOOK_JSON_KEY", "text"),
 		AppriseURL:               os.Getenv("APPRISE_URL"),
 		PostRestartScript:        os.Getenv("POST_RESTART_SCRIPT"),
 		ContainerLabel:           getEnv("AUTOHEAL_CONTAINER_LABEL", "autoheal"),
-		StartPeriod:              time.Duration(getEnvInt("AUTOHEAL_START_PERIOD", 0)) * time.Second,
-		Interval:                 time.Duration(getEnvInt("AUTOHEAL_INTERVAL", 5)) * time.Second,
-		DefaultStopTimeout:       getEnvInt("AUTOHEAL_DEFAULT_STOP_TIMEOUT", 10),
+		StartPeriod:              time.Duration(getEnvInt(log, "AUTOHEAL_START_PERIOD", 0)) * time.Second,
+		Interval:                 time.Duration(getEnvInt(log, "AUTOHEAL_INTERVAL", 5)) * time.Second,
+		DefaultStopTimeout:       getEnvInt(log, "AUTOHEAL_DEFAULT_STOP_TIMEOUT", 10),
 		OnlyMonitorRunning:       getEnv("AUTOHEAL_ONLY_MONITOR_RUNNING", "false") == "true",
-		CrashLoopStrikeThreshold: getEnvInt("AUTOHEAL_CRASHLOOP_STRIKES", 3),
+		CrashLoopStrikeThreshold: getEnvInt(log, "AUTOHEAL_CRASHLOOP_STRIKES", 3),
 	}
 }
 
@@ -73,14 +74,14 @@ func getEnv(key, def string) string {
 	return def
 }
 
-func getEnvInt(key string, def int) int {
+func getEnvInt(log zerolog.Logger, key string, def int) int {
 	v := os.Getenv(key)
 	if v == "" {
 		return def
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		log.Printf("invalid int for %s=%q, using default %d", key, v, def)
+		log.Warn().Msgf("invalid int for %s=%q, using default %d", key, v, def)
 		return def
 	}
 	return n
@@ -259,24 +260,26 @@ func hexDigit(b byte) byte {
 }
 
 func main() {
-	cfg := loadConfig()
-	log.Printf("AUTOHEAL_CONTAINER_LABEL=%s", cfg.ContainerLabel)
-	log.Printf("AUTOHEAL_START_PERIOD=%s", cfg.StartPeriod)
-	log.Printf("AUTOHEAL_INTERVAL=%s", cfg.Interval)
-	log.Printf("AUTOHEAL_DEFAULT_STOP_TIMEOUT=%d", cfg.DefaultStopTimeout)
-	log.Printf("AUTOHEAL_ONLY_MONITOR_RUNNING=%v", cfg.OnlyMonitorRunning)
-	log.Printf("AUTOHEAL_CRASHLOOP_STRIKES=%d", cfg.CrashLoopStrikeThreshold)
+	log := newLogger(getEnv("LOG_LEVEL", "info"))
+
+	cfg := loadConfig(log)
+	log.Info().Msgf("AUTOHEAL_CONTAINER_LABEL=%s", cfg.ContainerLabel)
+	log.Info().Msgf("AUTOHEAL_START_PERIOD=%s", cfg.StartPeriod)
+	log.Info().Msgf("AUTOHEAL_INTERVAL=%s", cfg.Interval)
+	log.Info().Msgf("AUTOHEAL_DEFAULT_STOP_TIMEOUT=%d", cfg.DefaultStopTimeout)
+	log.Info().Msgf("AUTOHEAL_ONLY_MONITOR_RUNNING=%v", cfg.OnlyMonitorRunning)
+	log.Info().Msgf("AUTOHEAL_CRASHLOOP_STRIKES=%d", cfg.CrashLoopStrikeThreshold)
 
 	client, err := newDockerClient(cfg)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal().Err(err).Msg("failed to set up docker client")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
 	if cfg.StartPeriod > 0 {
-		log.Printf("Monitoring containers for unhealthy status in %s", cfg.StartPeriod)
+		log.Info().Msgf("Monitoring containers for unhealthy status in %s", cfg.StartPeriod)
 		select {
 		case <-time.After(cfg.StartPeriod):
 		case <-ctx.Done():
@@ -289,7 +292,7 @@ func main() {
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	for {
-		runOnce(client, cfg, strikes)
+		runOnce(log, client, cfg, strikes)
 		select {
 		case <-ctx.Done():
 			return
@@ -298,10 +301,10 @@ func main() {
 	}
 }
 
-func runOnce(client *dockerClient, cfg config, strikes *strikeTracker) {
+func runOnce(log zerolog.Logger, client *dockerClient, cfg config, strikes *strikeTracker) {
 	containers, err := client.listUnhealthy(cfg)
 	if err != nil {
-		log.Printf("error listing unhealthy containers: %v", err)
+		log.Error().Err(err).Msg("error listing unhealthy containers")
 		return
 	}
 
@@ -312,7 +315,7 @@ func runOnce(client *dockerClient, cfg config, strikes *strikeTracker) {
 			continue
 		}
 		if len(c.Names) == 0 {
-			log.Printf("container %s has no name, which implies it does not exist - don't restart", shortID(c.ID))
+			log.Warn().Msgf("container %s has no name, which implies it does not exist - don't restart", shortID(c.ID))
 			continue
 		}
 		name := strings.TrimPrefix(c.Names[0], "/")
@@ -320,7 +323,7 @@ func runOnce(client *dockerClient, cfg config, strikes *strikeTracker) {
 		seenUnhealthy[c.ID] = true
 
 		if c.State == "restarting" {
-			log.Printf("Container %s (%s) found to be restarting - don't restart", name, shortIDStr)
+			log.Info().Msgf("Container %s (%s) found to be restarting - don't restart", name, shortIDStr)
 			continue
 		}
 
@@ -339,15 +342,15 @@ func runOnce(client *dockerClient, cfg config, strikes *strikeTracker) {
 			}
 		}
 
-		log.Printf("Container %s (%s) found to be unhealthy - Restarting container now with %ds timeout", name, shortIDStr, timeout)
+		log.Info().Msgf("Container %s (%s) found to be unhealthy - Restarting container now with %ds timeout", name, shortIDStr, timeout)
 		if err := client.restart(c.ID, timeout); err != nil {
-			log.Printf("Restarting container %s failed: %v", shortIDStr, err)
-			go notify(cfg, fmt.Sprintf("Container %s (%s) found to be unhealthy. Failed to restart the container!", name, shortIDStr))
+			log.Error().Err(err).Msgf("Restarting container %s failed", shortIDStr)
+			go notify(log, cfg, fmt.Sprintf("Container %s (%s) found to be unhealthy. Failed to restart the container!", name, shortIDStr))
 			continue
 		}
 
-		go notify(cfg, fmt.Sprintf("Container %s (%s) found to be unhealthy. Successfully restarted the container!", name, shortIDStr))
-		go runPostRestartScript(cfg, name, shortIDStr, c.State, timeout)
+		go notify(log, cfg, fmt.Sprintf("Container %s (%s) found to be unhealthy. Successfully restarted the container!", name, shortIDStr))
+		go runPostRestartScript(log, cfg, name, shortIDStr, c.State, timeout)
 
 		// Crash-loop tracking: only increments when unhealthy AND we just
 		// restarted it — a container that's unhealthy but "restarting"
@@ -355,7 +358,7 @@ func runOnce(client *dockerClient, cfg config, strikes *strikeTracker) {
 		// count as a strike here, since we didn't successfully complete a
 		// heal attempt for it.
 		if crossed, count := strikes.recordRestart(c.ID); crossed {
-			go notify(cfg, fmt.Sprintf("Container %s (%s) has been unhealthy and restarted %d times in a row without recovering — this looks like a crash loop, not a transient issue. Giving up on further automatic restarts; needs manual attention.", name, shortIDStr, count))
+			go notify(log, cfg, fmt.Sprintf("Container %s (%s) has been unhealthy and restarted %d times in a row without recovering — this looks like a crash loop, not a transient issue. Giving up on further automatic restarts; needs manual attention.", name, shortIDStr, count))
 		}
 	}
 
@@ -373,7 +376,7 @@ func runOnce(client *dockerClient, cfg config, strikes *strikeTracker) {
 		}
 		healthy, err := client.isHealthy(id)
 		if err != nil {
-			log.Printf("checking health of %s for strike-clear: %v", shortID(id), err)
+			log.Error().Err(err).Msgf("checking health of %s for strike-clear", shortID(id))
 			continue
 		}
 		if healthy {
@@ -389,40 +392,40 @@ func shortID(id string) string {
 	return id
 }
 
-func notify(cfg config, text string) {
-	log.Printf("notify: %s", text)
+func notify(log zerolog.Logger, cfg config, text string) {
+	log.Info().Msgf("notify: %s", text)
 	if cfg.WebhookURL != "" {
 		payload, _ := json.Marshal(map[string]string{cfg.WebhookJSONKey: text})
-		postJSON(cfg.WebhookURL, payload)
+		postJSON(log, cfg.WebhookURL, payload)
 	}
 	if cfg.AppriseURL != "" {
 		payload, _ := json.Marshal(map[string]string{"title": "Autoheal", "body": text})
-		postJSON(cfg.AppriseURL, payload)
+		postJSON(log, cfg.AppriseURL, payload)
 	}
 }
 
-func postJSON(url string, payload []byte) {
+func postJSON(log zerolog.Logger, url string, payload []byte) {
 	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(string(payload)))
 	if err != nil {
-		log.Printf("notify: building request to %s: %v", url, err)
+		log.Error().Err(err).Msgf("notify: building request to %s", url)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("notify: posting to %s: %v", url, err)
+		log.Error().Err(err).Msgf("notify: posting to %s", url)
 		return
 	}
 	defer resp.Body.Close()
 }
 
-func runPostRestartScript(cfg config, name, shortIDStr, state string, timeout int) {
+func runPostRestartScript(log zerolog.Logger, cfg config, name, shortIDStr, state string, timeout int) {
 	if cfg.PostRestartScript == "" {
 		return
 	}
 	cmd := exec.Command(cfg.PostRestartScript, name, shortIDStr, state, strconv.Itoa(timeout))
 	if err := cmd.Run(); err != nil {
-		log.Printf("post-restart script failed: %v", err)
+		log.Error().Err(err).Msg("post-restart script failed")
 	}
 }
