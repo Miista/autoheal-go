@@ -1,3 +1,4 @@
 autoheal-go
 .e2e/
 .e2e-debug*/
+dist/
