@@ -34,6 +34,8 @@ New in this rewrite:
 | `AUTOHEAL_CRASHLOOP_STRIKES` | `3` | Consecutive restarts without recovery before giving up and alerting once. |
 | `LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error`. |
 | `TZ` | unset (UTC) | IANA zone name, e.g. `Europe/Stockholm`, for local log timestamps. |
+| `NTFY_URL` | unset | Full [ntfy](https://ntfy.sh) topic URL, e.g. `https://ntfy.sh/mytopic`. Sends a plain-text message, not JSON. |
+| `NTFY_TOKEN` | unset | Bearer token for `NTFY_URL`, sent as a proper `Authorization` header. Omit for a public topic. |
 
 ## Crash-loop behavior
 

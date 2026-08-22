@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -260,5 +262,67 @@ func TestRunOnce_ListErrorSkipsCycleWithoutPanicking(t *testing.T) {
 
 	if len(client.restarted) != 0 {
 		t.Fatalf("a list error should skip the cycle entirely, got restarts %v", client.restarted)
+	}
+}
+
+func TestPostNtfy_SendsPlainTextWithBearerToken(t *testing.T) {
+	var gotAuth, gotTitle, gotBody, gotContentType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotTitle = r.Header.Get("Title")
+		gotContentType = r.Header.Get("Content-Type")
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		gotBody = string(buf[:n])
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	postNtfy(testLogger(), srv.URL+"/mytopic", "tk_secret123", "container X was restarted")
+
+	if gotAuth != "Bearer tk_secret123" {
+		t.Fatalf("expected Bearer token in Authorization header, got %q", gotAuth)
+	}
+	if gotTitle != "Autoheal" {
+		t.Fatalf("expected Title header, got %q", gotTitle)
+	}
+	if gotBody != "container X was restarted" {
+		t.Fatalf("expected plain-text body, got %q (should not be JSON-wrapped)", gotBody)
+	}
+	// ntfy's plain-text publish endpoint doesn't require Content-Type — must
+	// not send application/json, or ntfy treats the body as JSON to parse.
+	if gotContentType == "application/json" {
+		t.Fatal("must not send Content-Type: application/json to ntfy's plain-text endpoint")
+	}
+}
+
+func TestPostNtfy_NoTokenSendsNoAuthHeader(t *testing.T) {
+	var gotAuth string
+	authSet := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth, authSet = r.Header.Get("Authorization"), r.Header.Get("Authorization") != ""
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	postNtfy(testLogger(), srv.URL+"/public-topic", "", "test")
+
+	if authSet {
+		t.Fatalf("expected no Authorization header for a public topic (no token configured), got %q", gotAuth)
+	}
+}
+
+func TestNotify_NtfyConfiguredSendsToNtfy(t *testing.T) {
+	received := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	notify(testLogger(), config{NtfyURL: srv.URL + "/topic", NtfyToken: "tk_x"}, "hello")
+
+	if !received {
+		t.Fatal("expected notify() to POST to the configured NTFY_URL")
 	}
 }

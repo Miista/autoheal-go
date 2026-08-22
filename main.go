@@ -41,6 +41,8 @@ type config struct {
 	WebhookURL                string
 	WebhookJSONKey            string
 	AppriseURL                string
+	NtfyURL                   string
+	NtfyToken                 string
 	PostRestartScript         string
 	ContainerLabel            string
 	StartPeriod               time.Duration
@@ -57,6 +59,8 @@ func loadConfig(log zerolog.Logger) config {
 		WebhookURL:               os.Getenv("WEBHOOK_URL"),
 		WebhookJSONKey:           getEnv("WEBHOOK_JSON_KEY", "text"),
 		AppriseURL:               os.Getenv("APPRISE_URL"),
+		NtfyURL:                  os.Getenv("NTFY_URL"),
+		NtfyToken:                os.Getenv("NTFY_TOKEN"),
 		PostRestartScript:        os.Getenv("POST_RESTART_SCRIPT"),
 		ContainerLabel:           getEnv("AUTOHEAL_CONTAINER_LABEL", "autoheal"),
 		StartPeriod:              time.Duration(getEnvInt(log, "AUTOHEAL_START_PERIOD", 0)) * time.Second,
@@ -407,13 +411,13 @@ func shortID(id string) string {
 	return id
 }
 
-// notify sends text to any configured webhook/Apprise endpoint. The
+// notify sends text to any configured webhook/Apprise/ntfy endpoint. The
 // human-readable log line describing what happened is logged by the caller
 // (runOnce) right before this is invoked — this only logs when it actually
 // has somewhere external to send it, so nothing duplicates when no webhook
 // is configured.
 func notify(log zerolog.Logger, cfg config, text string) {
-	if cfg.WebhookURL == "" && cfg.AppriseURL == "" {
+	if cfg.WebhookURL == "" && cfg.AppriseURL == "" && cfg.NtfyURL == "" {
 		return
 	}
 	log.Debug().Msgf("Sending notification: %s", text)
@@ -424,6 +428,9 @@ func notify(log zerolog.Logger, cfg config, text string) {
 	if cfg.AppriseURL != "" {
 		payload, _ := json.Marshal(map[string]string{"title": "Autoheal", "body": text})
 		postJSON(log, cfg.AppriseURL, payload)
+	}
+	if cfg.NtfyURL != "" {
+		postNtfy(log, cfg.NtfyURL, cfg.NtfyToken, text)
 	}
 }
 
@@ -441,6 +448,33 @@ func postJSON(log zerolog.Logger, url string, payload []byte) {
 		return
 	}
 	defer resp.Body.Close()
+}
+
+// postNtfy publishes to ntfy's plain-text publish endpoint
+// (POST <server>/<topic>, body = the message) with the token as a proper
+// Authorization header, never embedded in the URL. NTFY_URL is the full
+// topic URL (e.g. https://ntfy.sh/mytopic); NTFY_TOKEN is optional (public
+// topics don't need one).
+func postNtfy(log zerolog.Logger, url, token, text string) {
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(text))
+	if err != nil {
+		log.Error().Err(err).Msgf("Couldn't build the ntfy request to %s", url)
+		return
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("Title", "Autoheal")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Error().Err(err).Msgf("Couldn't send the ntfy notification to %s", url)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Error().Msgf("ntfy returned %d publishing to %s", resp.StatusCode, url)
+	}
 }
 
 func runPostRestartScript(log zerolog.Logger, cfg config, name, shortIDStr, state string, timeout int) {
