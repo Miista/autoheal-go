@@ -102,11 +102,14 @@ New in this rewrite:
 | Variable | Default | Notes |
 |---|---|---|
 | `AUTOHEAL_CRASHLOOP_STRIKES` | `3` | Consecutive restarts without recovery before giving up and alerting once. |
+| `LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error`. Invalid values fall back to `info` with a warning. |
 
-`notify()` also always logs the notification text via the container's own
-log output (`docker logs`), regardless of whether `WEBHOOK_URL`/`APPRISE_URL`
-are configured — so crash-loop and restart events are visible even with no
-webhook set up.
+Every restart, restart failure, and crash-loop event is logged as a plain,
+human-readable line regardless of whether `WEBHOOK_URL`/`APPRISE_URL` are
+configured, so nothing is silent with no webhook set up. The webhook/Apprise
+payload text itself is only additionally echoed at debug level
+(`LOG_LEVEL=debug`), since at info level it would just repeat the line
+already logged.
 
 ## Timezone
 

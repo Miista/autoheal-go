@@ -87,7 +87,7 @@ scenario_restart_and_recover() {
   start_autoheal "$dir" "$name-autoheal" ""
 
   local ok=1
-  wait_for "autoheal restarts target" 20 "docker logs $name-autoheal 2>&1 | grep -q 'Successfully restarted the container'" \
+  wait_for "autoheal restarts target" 20 "docker logs $name-autoheal 2>&1 | grep -q 'Restarted .* successfully'" \
     || { echo "   FAIL: autoheal never restarted target"; ok=0; }
 
   # recovery: flip healthy, confirm it settles healthy and no crash-loop fired
@@ -148,15 +148,15 @@ scenario_crashloop_gives_up() {
   wait_for "crash-loop notification fires" 30 "docker logs $name-autoheal 2>&1 | grep -q 'looks like a crash loop'" \
     || { echo "   FAIL: crash-loop notification never fired"; ok=0; fail=$((fail+1)); cleanup_scenario "$dir"; return; }
 
-  restarts_at_giveup=$(docker logs "$name-autoheal" 2>&1 | grep -c "Successfully restarted the container")
+  restarts_at_giveup=$(docker logs "$name-autoheal" 2>&1 | grep -c "Restarted .* successfully")
 
   # give it several more poll cycles worth of time while still unhealthy —
   # restart count must NOT climb further once given up
   sleep 8
-  restarts_after_wait=$(docker logs "$name-autoheal" 2>&1 | grep -c "Successfully restarted the container")
+  restarts_after_wait=$(docker logs "$name-autoheal" 2>&1 | grep -c "Restarted .* successfully")
   [ "$restarts_after_wait" = "$restarts_at_giveup" ] || { echo "   FAIL: autoheal kept restarting after giving up ($restarts_at_giveup -> $restarts_after_wait)"; ok=0; }
 
-  docker logs "$name-autoheal" 2>&1 | grep -q "found to be restarting - don't restart" && { echo "   FAIL: unexpected 'restarting' skip log — check scenario assumptions"; }
+  docker logs "$name-autoheal" 2>&1 | grep -q "is already restarting, so leaving it alone" && { echo "   FAIL: unexpected 'restarting' skip log — check scenario assumptions"; }
 
   cleanup_scenario "$dir"
   if [ "$ok" = 1 ]; then echo "   PASS"; pass=$((pass+1)); else fail=$((fail+1)); fi
@@ -181,7 +181,7 @@ scenario_recovers_after_giveup() {
   wait_for "crash-loop notification fires (given up)" 30 "docker logs $name-autoheal 2>&1 | grep -q 'looks like a crash loop'" \
     || { echo "   FAIL: crash-loop notification never fired"; ok=0; fail=$((fail+1)); cleanup_scenario "$dir"; return; }
 
-  restarts_at_giveup=$(docker logs "$name-autoheal" 2>&1 | grep -c "Successfully restarted the container")
+  restarts_at_giveup=$(docker logs "$name-autoheal" 2>&1 | grep -c "Restarted .* successfully")
 
   # now genuinely recover: flip the healthcheck to pass. The health-check's
   # own start-period + retries means "healthy" isn't instant — wait for it
@@ -200,7 +200,7 @@ scenario_recovers_after_giveup() {
     || { echo "   FAIL: target never relapsed to unhealthy"; ok=0; }
 
   wait_for "autoheal attempts a fresh restart after recovery+relapse" 20 \
-    "[ \"\$(docker logs $name-autoheal 2>&1 | grep -c 'Successfully restarted the container')\" -gt \"$restarts_at_giveup\" ]" \
+    "[ \"\$(docker logs $name-autoheal 2>&1 | grep -c 'Restarted .* successfully')\" -gt \"$restarts_at_giveup\" ]" \
     || { echo "   FAIL: autoheal never restarted again after the container was confirmed healthy and relapsed — still stuck given-up"; ok=0; }
 
   cleanup_scenario "$dir"

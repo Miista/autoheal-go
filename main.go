@@ -263,23 +263,21 @@ func main() {
 	log := newLogger(getEnv("LOG_LEVEL", "info"))
 
 	cfg := loadConfig(log)
-	log.Info().Msgf("AUTOHEAL_CONTAINER_LABEL=%s", cfg.ContainerLabel)
-	log.Info().Msgf("AUTOHEAL_START_PERIOD=%s", cfg.StartPeriod)
-	log.Info().Msgf("AUTOHEAL_INTERVAL=%s", cfg.Interval)
-	log.Info().Msgf("AUTOHEAL_DEFAULT_STOP_TIMEOUT=%d", cfg.DefaultStopTimeout)
-	log.Info().Msgf("AUTOHEAL_ONLY_MONITOR_RUNNING=%v", cfg.OnlyMonitorRunning)
-	log.Info().Msgf("AUTOHEAL_CRASHLOOP_STRIKES=%d", cfg.CrashLoopStrikeThreshold)
+	log.Info().Msgf("Watching containers labeled %q, checking every %s, giving up after %d unhealthy restarts in a row", cfg.ContainerLabel, cfg.Interval, cfg.CrashLoopStrikeThreshold)
+	if cfg.OnlyMonitorRunning {
+		log.Info().Msg("Only monitoring containers that are currently running")
+	}
 
 	client, err := newDockerClient(cfg)
 	if err != nil {
-		log.Fatal().Err(err).Msg("failed to set up docker client")
+		log.Fatal().Err(err).Msg("Couldn't connect to the Docker daemon")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
 	if cfg.StartPeriod > 0 {
-		log.Info().Msgf("Monitoring containers for unhealthy status in %s", cfg.StartPeriod)
+		log.Info().Msgf("Waiting %s before the first check", cfg.StartPeriod)
 		select {
 		case <-time.After(cfg.StartPeriod):
 		case <-ctx.Done():
@@ -304,7 +302,7 @@ func main() {
 func runOnce(log zerolog.Logger, client *dockerClient, cfg config, strikes *strikeTracker) {
 	containers, err := client.listUnhealthy(cfg)
 	if err != nil {
-		log.Error().Err(err).Msg("error listing unhealthy containers")
+		log.Error().Err(err).Msg("Couldn't ask Docker which containers are unhealthy — will try again next cycle")
 		return
 	}
 
@@ -315,7 +313,7 @@ func runOnce(log zerolog.Logger, client *dockerClient, cfg config, strikes *stri
 			continue
 		}
 		if len(c.Names) == 0 {
-			log.Warn().Msgf("container %s has no name, which implies it does not exist - don't restart", shortID(c.ID))
+			log.Warn().Msgf("A container (%s) with no name showed up as unhealthy — it likely no longer exists, so leaving it alone", shortID(c.ID))
 			continue
 		}
 		name := strings.TrimPrefix(c.Names[0], "/")
@@ -323,7 +321,7 @@ func runOnce(log zerolog.Logger, client *dockerClient, cfg config, strikes *stri
 		seenUnhealthy[c.ID] = true
 
 		if c.State == "restarting" {
-			log.Info().Msgf("Container %s (%s) found to be restarting - don't restart", name, shortIDStr)
+			log.Info().Msgf("%s is already restarting, so leaving it alone this cycle", name)
 			continue
 		}
 
@@ -342,14 +340,15 @@ func runOnce(log zerolog.Logger, client *dockerClient, cfg config, strikes *stri
 			}
 		}
 
-		log.Info().Msgf("Container %s (%s) found to be unhealthy - Restarting container now with %ds timeout", name, shortIDStr, timeout)
+		log.Info().Msgf("%s is unhealthy — restarting it now (%ds timeout)", name, timeout)
 		if err := client.restart(c.ID, timeout); err != nil {
-			log.Error().Err(err).Msgf("Restarting container %s failed", shortIDStr)
-			go notify(log, cfg, fmt.Sprintf("Container %s (%s) found to be unhealthy. Failed to restart the container!", name, shortIDStr))
+			log.Error().Err(err).Msgf("Tried to restart %s but the restart itself failed", name)
+			go notify(log, cfg, fmt.Sprintf("%s (%s) is unhealthy and the restart attempt failed.", name, shortIDStr))
 			continue
 		}
 
-		go notify(log, cfg, fmt.Sprintf("Container %s (%s) found to be unhealthy. Successfully restarted the container!", name, shortIDStr))
+		log.Info().Msgf("Restarted %s successfully", name)
+		go notify(log, cfg, fmt.Sprintf("%s (%s) was unhealthy and has been restarted.", name, shortIDStr))
 		go runPostRestartScript(log, cfg, name, shortIDStr, c.State, timeout)
 
 		// Crash-loop tracking: only increments when unhealthy AND we just
@@ -358,7 +357,8 @@ func runOnce(log zerolog.Logger, client *dockerClient, cfg config, strikes *stri
 		// count as a strike here, since we didn't successfully complete a
 		// heal attempt for it.
 		if crossed, count := strikes.recordRestart(c.ID); crossed {
-			go notify(log, cfg, fmt.Sprintf("Container %s (%s) has been unhealthy and restarted %d times in a row without recovering — this looks like a crash loop, not a transient issue. Giving up on further automatic restarts; needs manual attention.", name, shortIDStr, count))
+			log.Warn().Msgf("%s has now been restarted %d times in a row without recovering — this looks like a crash loop. Giving up on further automatic restarts until it's confirmed healthy again", name, count)
+			go notify(log, cfg, fmt.Sprintf("%s (%s) has crash-looped: %d unhealthy restarts in a row with no recovery. Giving up on further automatic restarts — needs manual attention.", name, shortIDStr, count))
 		}
 	}
 
@@ -376,10 +376,11 @@ func runOnce(log zerolog.Logger, client *dockerClient, cfg config, strikes *stri
 		}
 		healthy, err := client.isHealthy(id)
 		if err != nil {
-			log.Error().Err(err).Msgf("checking health of %s for strike-clear", shortID(id))
+			log.Error().Err(err).Msgf("Couldn't check whether %s has recovered — will try again next cycle", shortID(id))
 			continue
 		}
 		if healthy {
+			log.Info().Msgf("%s is healthy again — clearing its crash-loop history", shortID(id))
 			strikes.clear(id)
 		}
 	}
@@ -392,8 +393,16 @@ func shortID(id string) string {
 	return id
 }
 
+// notify sends text to any configured webhook/Apprise endpoint. The
+// human-readable log line describing what happened is logged by the caller
+// (runOnce) right before this is invoked — this only logs when it actually
+// has somewhere external to send it, so nothing duplicates when no webhook
+// is configured.
 func notify(log zerolog.Logger, cfg config, text string) {
-	log.Info().Msgf("notify: %s", text)
+	if cfg.WebhookURL == "" && cfg.AppriseURL == "" {
+		return
+	}
+	log.Debug().Msgf("Sending notification: %s", text)
 	if cfg.WebhookURL != "" {
 		payload, _ := json.Marshal(map[string]string{cfg.WebhookJSONKey: text})
 		postJSON(log, cfg.WebhookURL, payload)
@@ -407,14 +416,14 @@ func notify(log zerolog.Logger, cfg config, text string) {
 func postJSON(log zerolog.Logger, url string, payload []byte) {
 	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(string(payload)))
 	if err != nil {
-		log.Error().Err(err).Msgf("notify: building request to %s", url)
+		log.Error().Err(err).Msgf("Couldn't build the notification request to %s", url)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Error().Err(err).Msgf("notify: posting to %s", url)
+		log.Error().Err(err).Msgf("Couldn't send the notification to %s", url)
 		return
 	}
 	defer resp.Body.Close()
