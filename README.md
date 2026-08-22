@@ -6,8 +6,32 @@ A from-scratch Go rewrite of [`willfarrell/autoheal`](https://github.com/willfar
 with no memory of how many times it's already tried — fine for a one-off
 fix, but it gives no signal when restarting isn't actually helping.
 
-Everything else mirrors upstream's surface and logic exactly: same env
-vars, same defaults, same restart/notify/post-restart-script flow.
+Everything else mirrors upstream's surface and logic: same env vars, same
+defaults, same restart/notify/post-restart-script flow.
+
+## Drop-in compatibility
+
+Verified against both `willfarrell/autoheal:1.2.0` (the version actually
+deployed on optiplex at the time of writing) and `:latest` (which added
+webhook/apprise/post-restart-script/only-monitor-running — 1.2.0 predates
+all of them). This port targets `:latest`'s feature set but is a safe
+drop-in for a 1.2.0 deployment: every env var 1.2.0 reads
+(`AUTOHEAL_CONTAINER_LABEL`, `DOCKER_SOCK`, `AUTOHEAL_START_PERIOD`,
+`AUTOHEAL_INTERVAL`, `AUTOHEAL_DEFAULT_STOP_TIMEOUT`) behaves the same way
+with the same default, and the extra vars this port adds beyond 1.2.0 are
+all additive with no-op defaults — unset, they don't change behavior for
+an existing 1.2.0-style setup (same `docker.sock` mount, same restart
+policy, no new required config).
+
+Two cosmetic differences, neither functional:
+- Log line timestamp format differs (`log.Printf`'s default vs. upstream's
+  `DD-MM-YYYY HH:MM:SS`) — nothing in this fleet parses autoheal's log
+  lines today, confirmed no Gatus/alerting rule depends on the format.
+- The "container has no name" skip case is detected differently
+  (`len(Names) == 0` here vs. upstream's string-compare against the
+  literal `"null"` its `jq` pipeline produces) — same underlying Docker
+  API condition, same outcome (skip, don't restart), different code path
+  to get there.
 
 ## Why a rewrite instead of a patch
 
