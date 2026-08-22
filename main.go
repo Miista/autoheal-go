@@ -31,6 +31,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	_ "time/tzdata" // FROM scratch has no /usr/share/zoneinfo; embed it so TZ works for log timestamps
 )
 
 type config struct {
