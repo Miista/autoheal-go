@@ -9,3 +9,4 @@ dist/
 # A prefix rather than a list, so a directory that does not exist yet is
 # covered too.
 /testbed*/
+coverage.out

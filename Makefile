@@ -1,4 +1,4 @@
-.PHONY: all build test test-unit test-integration clean
+.PHONY: all build test test-unit test-integration cover cover-html clean
 
 all: build
 
@@ -30,5 +30,22 @@ test-unit:
 test-integration:
 	go test -tags integration -count=1 -p 1 -shuffle=on ./test/...
 
+# Unit coverage only. The integration suite runs autoheal as a container, and
+# collecting coverage from it means building with -cover and mounting a
+# GOCOVERDIR for it to write to -- worth doing, not done yet, and a number that
+# silently covered only half of what it claimed would be worse than no number.
+# The root package only. test/... is the harness, the patient, the receiver and
+# the sandbox: things that exist to test autoheal rather than things autoheal
+# is made of. Counting them drags the total to a number that says nothing --
+# 12% where the code under test is 44% -- because they have no unit tests and
+# are not meant to.
+cover:
+	go test -cover -coverprofile=coverage.out .
+	@echo
+	@go tool cover -func=coverage.out | tail -1
+
+cover-html: cover
+	go tool cover -html=coverage.out
+
 clean:
-	rm -f autoheal-go
+	rm -f autoheal-go coverage.out
