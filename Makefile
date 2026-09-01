@@ -10,16 +10,16 @@ build:
 # everything locally: its own registry, its own images, its own notification
 # receiver. Nothing upstream is contacted, so it works offline.
 #
-# Both pass -count=1. Go caches a passing test's result and replays it when
-# nothing it can see has changed, which is right for pure code and misleading
-# here: these tests depend on a daemon, on images and on containers, none of
-# which the cache knows about. A cached pass would say the world was fine when
-# only the source was unchanged.
+# Only test-integration passes -count=1. Go caches a passing result and
+# replays it when nothing it can see has changed, which is right for pure code
+# and wrong for these: they depend on a daemon, on images and on containers,
+# none of which the cache knows about, so a cached pass would say the world was
+# fine when only the source was unchanged.
 
 test: test-unit test-integration
 
 test-unit:
-	go test -count=1 -shuffle=on ./...
+	go test -shuffle=on ./...
 
 # -p 1 keeps packages sequential: the suites share a registry port and a
 # testbed.
