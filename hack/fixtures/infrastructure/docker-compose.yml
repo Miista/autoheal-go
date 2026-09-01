@@ -1,0 +1,35 @@
+# The registry the test images live in.
+#
+# Infrastructure, not part of the world under test: a real stack pulls from
+# GHCR or Docker Hub, which no compose file declares as a service. A fixture
+# declaring its own registry would describe a world no host has.
+#
+# Its own compose project, started once for the whole package and left up.
+# Starting and stopping it per test was a race that failed roughly one test
+# per run -- always whichever happened to be running when the container lost
+# it, so the failure looked like it belonged to that test. What each test
+# pushed is still cleared between tests; see emptyRegistry.
+#
+# Published on 5555 because images are named localhost:5555/... -- the subject drives
+# the host's daemon, which can only resolve names it knows.
+services:
+  registry:
+    image: registry:3
+    container_name: autoheal-integration-registry
+    ports:
+      - "5555:5000"
+    environment:
+      REGISTRY_HTTP_TLS_CERTIFICATE: /certs/cert.pem
+      REGISTRY_HTTP_TLS_KEY: /certs/key.pem
+    volumes:
+      # Beside this file. The suite generates them here when it starts and
+      # removes them when it finishes -- the registry is the only thing that
+      # serves TLS, so this is where they belong.
+      - ./certs:/certs:ro
+    # Waited on by `compose up --wait`, so nothing has to probe for
+    # readiness: the registry answers /v2/ only once it will accept pushes.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--no-check-certificate", "-O", "-", "https://localhost:5000/v2/"]
+      interval: 1s
+      timeout: 2s
+      retries: 30

@@ -1,4 +1,11 @@
 autoheal-go
-.e2e/
-.e2e-debug*/
 dist/
+
+# Everything the integration suites build: the project under test and the
+# image build contexts. Removed on cleanup, so they are only ever here after a
+# run that was killed -- which is exactly when they would be committed by
+# accident.
+#
+# A prefix rather than a list, so a directory that does not exist yet is
+# covered too.
+/testbed*/

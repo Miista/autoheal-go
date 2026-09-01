@@ -3,7 +3,17 @@ WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
 COPY main.go strikes.go log.go ./
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o autoheal-go .
+# COVER=1 builds a coverage-instrumented binary, so the integration suite --
+# which exercises autoheal as a real container against a real daemon -- can
+# report coverage that unit tests structurally cannot reach
+# (go.dev/blog/integration-test-coverage). Run it with GOCOVERDIR pointed at a
+# mounted directory. Unset, this is an ordinary build.
+ARG COVER=0
+RUN if [ "$COVER" = "1" ]; then \
+      CGO_ENABLED=0 GOOS=linux go build -cover -coverpkg=./... -trimpath -o autoheal-go .; \
+    else \
+      CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o autoheal-go .; \
+    fi
 
 FROM alpine:3 AS certs
 RUN apk add --no-cache ca-certificates

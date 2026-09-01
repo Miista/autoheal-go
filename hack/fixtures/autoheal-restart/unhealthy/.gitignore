@@ -1,0 +1,4 @@
+# The registry certificate and the gate files a test trips are written into the
+# scenario as it runs; neither is part of the stack it describes.
+/certs/
+/gate/
