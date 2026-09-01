@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -163,8 +164,10 @@ func (d *dockerClient) listUnhealthy(cfg config) ([]containerSummary, error) {
 		return nil, err
 	}
 
-	url := fmt.Sprintf("%s/containers/json?filters=%s", d.endpoint, urlQueryEscape(string(filterJSON)))
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	// Named endpoint rather than url: the package is what escapes the filter.
+	endpoint := fmt.Sprintf("%s/containers/json?filters=%s",
+		d.endpoint, url.QueryEscape(string(filterJSON)))
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -251,30 +254,6 @@ func (d *dockerClient) restart(containerID string, timeoutSeconds int) error {
 		return fmt.Errorf("docker API returned %d restarting %s", resp.StatusCode, containerID)
 	}
 	return nil
-}
-
-func urlQueryEscape(s string) string {
-	// net/url.QueryEscape would also do, but avoids importing net/url just
-	// for this one call given http.NewRequest already needs it internally —
-	// kept explicit for clarity that this is escaping a JSON blob into a
-	// query string, exactly like upstream's inline sed/curl composition.
-	q := make([]byte, 0, len(s)*3)
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
-			q = append(q, c)
-		} else {
-			q = append(q, '%', hexDigit(c>>4), hexDigit(c&0xf))
-		}
-	}
-	return string(q)
-}
-
-func hexDigit(b byte) byte {
-	if b < 10 {
-		return '0' + b
-	}
-	return 'a' + (b - 10)
 }
 
 func main() {
