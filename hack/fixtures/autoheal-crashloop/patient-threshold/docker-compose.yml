@@ -1,0 +1,30 @@
+# The same stack as gives-up, with a higher CRASHLOOP_STRIKES in its .env.
+#
+# The pair is what proves autoheal reads the setting: a threshold that was
+# hardcoded, off by one, or read once and cached passes against one of these
+# and fails against the other. Identical in every other respect on purpose --
+# anything else that differed would be a second explanation for a failure.
+#
+# Both thresholds are kept low because the tests wait for autoheal to reach
+# them, and restarts at a one-second poll are a long time to sit in a test for
+# no extra confidence.
+services:
+  looper:
+    image: autoheal-patient:integration
+    labels:
+      autoheal: "true"
+
+  autoheal:
+    image: autoheal:integration
+    environment:
+      AUTOHEAL_INTERVAL: "1"
+      AUTOHEAL_START_PERIOD: "0"
+      # From .env, which the test reads too: the number it expects and the
+      # number autoheal is given must be the same one.
+      AUTOHEAL_CRASHLOOP_STRIKES: "${CRASHLOOP_STRIKES}"
+      # Restarting is not what these scenarios are timing, so do not wait ten
+      # seconds for a container that has nothing to flush.
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: "1"
+      LOG_LEVEL: debug
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

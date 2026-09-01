@@ -8,28 +8,16 @@ services:
   # Labelled and made sick by the test: autoheal's to restart.
   sick:
     image: autoheal-patient:integration
-    environment:
-      GATE: /gate/sick
-    volumes:
-      - ./gate:/gate
     labels:
       autoheal: "true"
 
   # The negative case: made sick in exactly the same way, but unlabelled.
   sick-unlabelled:
     image: autoheal-patient:integration
-    environment:
-      GATE: /gate/sick-unlabelled
-    volumes:
-      - ./gate:/gate
 
   # Labelled but never made sick: the label alone must not be enough.
   well:
     image: autoheal-patient:integration
-    environment:
-      GATE: /gate/well
-    volumes:
-      - ./gate:/gate
     labels:
       autoheal: "true"
 

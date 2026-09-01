@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"fmt"
 	"strings"
 	"time"
 )
@@ -69,4 +70,58 @@ func (s *Scenario) WaitForLine(service, want string) string {
 		},
 		func() string { return s.Logs(service) })
 	return found
+}
+
+// WaitForRestarts blocks until a service has been restarted want times since
+// from, and returns how many were seen.
+//
+// Counted by watching the container's start time, not docker's RestartCount:
+// that field only counts restarts docker itself performed under a restart
+// policy, and stays at zero for the ones autoheal asks for. Verified rather
+// than assumed -- two `docker restart` calls leave it reading 0.
+//
+// The count is the honest signal that a scenario has been exercised. Waiting
+// for a log line instead would mean sequencing the test on the same wording it
+// is about to assert on, and a subject that printed nothing would look like a
+// subject that did nothing.
+func (s *Scenario) WaitForRestarts(service string, from time.Time, want int) int {
+	s.t.Helper()
+
+	seen, last := 0, from
+	s.waitFor(fmt.Sprintf("%s to be restarted %d times", service, want),
+		90*time.Second,
+		func() bool {
+			if at := s.StartedAt(service); at.After(last) {
+				seen++
+				last = at
+			}
+			return seen >= want
+		},
+		func() string {
+			return fmt.Sprintf("saw %d of %d restarts\n%s", seen, want, s.Logs(service))
+		})
+	return seen
+}
+
+// Times is how often a service has printed a line containing want.
+//
+// A count rather than a yes/no, because "it happened" cannot tell a second
+// occurrence from the first one still being there. A test that drives a
+// container round the same loop twice needs to know the second lap happened,
+// and Contains says yes to the line left over from the first.
+func (s *Scenario) Times(service, want string) int {
+	s.t.Helper()
+	return strings.Count(s.Logs(service), want)
+}
+
+// WaitForMore blocks until a service has printed want more times than it had
+// at was.
+//
+// The shape a test wants when it drives something round a loop: take a count,
+// act, then wait for the count to move.
+func (s *Scenario) WaitForMore(service, want string, was int) {
+	s.t.Helper()
+	s.waitFor(fmt.Sprintf("%s to print %q again", service, want), 60*time.Second,
+		func() bool { return s.Times(service, want) > was },
+		func() string { return s.Logs(service) })
 }

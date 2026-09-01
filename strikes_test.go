@@ -101,3 +101,46 @@ func TestStrikeTracker_NotGivenUpBelowThreshold(t *testing.T) {
 		t.Fatal("should not be given up before crossing threshold")
 	}
 }
+
+// A condition that lasts should be logged when it starts, not on every poll.
+// A container paused for a twenty-minute backup is one line at a five-second
+// interval, or two hundred and forty.
+func TestFirstMentionSpeaksOncePerState(t *testing.T) {
+	s := newStrikeTracker(3)
+
+	if !s.firstMention("abc", "paused") {
+		t.Error("the first time a state is seen should be worth saying")
+	}
+	for i := 0; i < 5; i++ {
+		if s.firstMention("abc", "paused") {
+			t.Fatal("the same state should not be worth saying again")
+		}
+	}
+
+	// A different container is a different event, however alike the state.
+	if !s.firstMention("def", "paused") {
+		t.Error("another container's pause is its own event")
+	}
+
+	// And so is a genuine change: paused, running, paused again is two pauses
+	// a reader wants to see, not one.
+	if !s.firstMention("abc", "running") {
+		t.Error("a change of state should be worth saying")
+	}
+	if !s.firstMention("abc", "paused") {
+		t.Error("being paused again after running is a new pause")
+	}
+}
+
+// Clearing a container's history forgets what was said about it, so a pause
+// after a recovery is reported rather than swallowed as a repeat.
+func TestClearForgetsWhatWasMentioned(t *testing.T) {
+	s := newStrikeTracker(3)
+
+	s.firstMention("abc", "paused")
+	s.clear("abc")
+
+	if !s.firstMention("abc", "paused") {
+		t.Error("after clearing, the same state should be worth saying again")
+	}
+}

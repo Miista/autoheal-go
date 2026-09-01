@@ -38,6 +38,11 @@ type strikeTracker struct {
 	threshold int
 	counts    map[string]int
 	givenUp   map[string]bool
+	// mentioned records the states already reported for a container, so a
+	// condition that lasts is logged when it starts rather than on every poll.
+	// A container paused for a twenty-minute backup is one line, not one line
+	// every AUTOHEAL_INTERVAL.
+	mentioned map[string]string
 }
 
 func newStrikeTracker(threshold int) *strikeTracker {
@@ -45,7 +50,25 @@ func newStrikeTracker(threshold int) *strikeTracker {
 		threshold: threshold,
 		counts:    make(map[string]int),
 		givenUp:   make(map[string]bool),
+		mentioned: make(map[string]string),
 	}
+}
+
+// firstMention reports whether this is the first cycle a container has been
+// seen in the given state, and records it either way.
+//
+// The state is remembered rather than a bare "already said": a container that
+// goes paused, runs again and is paused a second time is two separate events a
+// reader wants to see, and comparing the state distinguishes that from the
+// same pause continuing.
+func (s *strikeTracker) firstMention(containerID, state string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.mentioned[containerID] == state {
+		return false
+	}
+	s.mentioned[containerID] = state
+	return true
 }
 
 // recordRestart increments the strike count for containerID and reports
@@ -97,4 +120,7 @@ func (s *strikeTracker) clear(containerID string) {
 	defer s.mu.Unlock()
 	delete(s.counts, containerID)
 	delete(s.givenUp, containerID)
+	// A container that recovered starts over in every sense: if it is paused
+	// again later, that is a new event and worth saying so.
+	delete(s.mentioned, containerID)
 }

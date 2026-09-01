@@ -36,20 +36,20 @@ import (
 )
 
 type config struct {
-	DockerSock                string
-	CurlTimeout               time.Duration
-	WebhookURL                string
-	WebhookJSONKey            string
-	AppriseURL                string
-	NtfyURL                   string
-	NtfyToken                 string
-	PostRestartScript         string
-	ContainerLabel            string
-	StartPeriod               time.Duration
-	Interval                  time.Duration
-	DefaultStopTimeout        int
-	OnlyMonitorRunning        bool
-	CrashLoopStrikeThreshold  int
+	DockerSock               string
+	CurlTimeout              time.Duration
+	WebhookURL               string
+	WebhookJSONKey           string
+	AppriseURL               string
+	NtfyURL                  string
+	NtfyToken                string
+	PostRestartScript        string
+	ContainerLabel           string
+	StartPeriod              time.Duration
+	Interval                 time.Duration
+	DefaultStopTimeout       int
+	OnlyMonitorRunning       bool
+	CrashLoopStrikeThreshold int
 }
 
 func loadConfig(log zerolog.Logger) config {
@@ -342,6 +342,30 @@ func runOnce(log zerolog.Logger, client dockerAPI, cfg config, strikes *strikeTr
 			log.Info().Msgf("%s is already restarting, so leaving it alone this cycle", name)
 			continue
 		}
+
+		// A paused container is somebody's deliberate act -- `docker compose
+		// pause` while a backup runs -- not a fault to repair. Its processes
+		// are frozen, so its healthcheck stops answering and docker calls it
+		// unhealthy soon after, which is what made this worth guarding: it
+		// looks exactly like something to fix.
+		//
+		// Restarting it would resume it, which is the one thing the person who
+		// paused it was avoiding, and it would then keep looking unhealthy
+		// until it had been written off as a crash loop. upstream/98.
+		//
+		// Still recorded as seen above, so being paused holds its strike
+		// history where it is rather than clearing it: the container has not
+		// recovered, it has only stopped being asked.
+		// Said once, when the pause starts. A backup can hold a container
+		// paused for twenty minutes, and a line per poll would bury everything
+		// else in the log for as long as it lasted.
+		if c.State == "paused" {
+			if strikes.firstMention(c.ID, c.State) {
+				log.Info().Msgf("%s is paused, so leaving it alone until it is resumed", name)
+			}
+			continue
+		}
+		strikes.firstMention(c.ID, c.State)
 
 		// Once confirmed crash-looping, further blind restarts aren't
 		// helping — stop attempting them and just keep the container

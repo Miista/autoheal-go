@@ -5,10 +5,11 @@
 // unhealthy from its first probe, so `compose up --wait` never returns and the
 // world never comes up.
 //
-// The patient is healthy until a test says otherwise. It watches a gate file
-// and reports unhealthy exactly while that file exists:
+// The patient starts healthy and stays that way until a test says otherwise:
 //
-//	GATE=/gate/sick     # bind-mounted from the scenario directory
+//	POST /sick    -> unhealthy from the next probe
+//	POST /well    -> healthy again
+//	GET  /        -> "ok" or "sick", what the next probe will report
 //
 // A test brings the stack up -- everything healthy, no races -- then trips the
 // gate when it is ready, and knows rather than hopes that the container was
@@ -16,50 +17,110 @@
 // cannot give you: with a schedule, a test that misses its window cannot tell
 // "autoheal did nothing" from "autoheal was never asked".
 //
-// Removing the gate makes it healthy again, which is how a scenario about
-// recovery -- or about autoheal giving up after too many restarts -- says what
-// it means.
+// The gate outlives a restart, because it is kept in the container's own
+// filesystem rather than in memory. `docker restart` stops and starts the same
+// container -- it does not recreate it -- so the writable layer is untouched
+// and the patient comes back exactly as sick as it went down. That is what a
+// crash loop is: the cause survives the restart. A scenario that wants
+// recovery clears the gate itself, which is the honest shape -- the test is
+// what fixed it.
+//
+// No bind mount and no named volume, so a fixture declares nothing for this
+// and there is nothing left on the host to clean up.
 package main
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 )
 
+// gatePath is inside the container, deliberately. See the package comment.
+const gatePath = "/patient.sick"
+
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "-check" {
+	switch {
+	case len(os.Args) > 1 && os.Args[1] == "-check":
 		os.Exit(check())
+	// The image is FROM scratch, so there is no curl and no shell to reach the
+	// endpoint with. `docker exec <id> /patient -post /sick` is how a test
+	// talks to a patient without a fixture publishing a port per container.
+	case len(os.Args) > 2 && os.Args[1] == "-post":
+		os.Exit(post(os.Args[2]))
 	}
 
-	// Nothing to do but stay up: the healthcheck runs as its own process and
-	// reads the gate itself, so this one holds the container open and no more.
-	//
-	// Sleeping rather than blocking forever, because the runtime treats a
-	// permanent block with nothing else running as a deadlock and panics --
-	// which would kill the container the moment it started.
-	fmt.Printf("patient: up, watching %s\n", gate())
-	for {
-		time.Sleep(time.Hour)
+	http.HandleFunc("/sick", set(true))
+	http.HandleFunc("/well", set(false))
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, verdict())
+	})
+
+	addr := ":" + port()
+	fmt.Printf("patient: up on %s, %s\n", addr, verdict())
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		fmt.Fprintf(os.Stderr, "patient: %v\n", err)
+		os.Exit(1)
 	}
 }
 
-// check is what the image's HEALTHCHECK runs: unhealthy while the gate file
-// exists, healthy otherwise.
-//
-// A missing gate is healthy rather than an error. A scenario that never trips
-// one is a container that is simply well, and that is the common case -- it is
-// what every other service in a fixture is there to be.
+func set(sick bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		if sick {
+			err = os.WriteFile(gatePath, nil, 0o666)
+		} else if err = os.Remove(gatePath); os.IsNotExist(err) {
+			err = nil // already well
+		}
+		if err != nil {
+			// Unable to record it means the healthcheck would disagree with
+			// what the test was told, which is worse than failing here.
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			fmt.Fprintf(os.Stderr, "patient: %v\n", err)
+			return
+		}
+		fmt.Printf("patient: now %s\n", verdict())
+		fmt.Fprintln(w, verdict())
+	}
+}
+
+// check is what the image's HEALTHCHECK runs. It reads the gate directly
+// rather than asking the server, so a wedged server is unhealthy rather than
+// reported as whatever it last said.
 func check() int {
-	if _, err := os.Stat(gate()); err == nil {
+	if _, err := os.Stat(gatePath); err == nil {
 		return 1
 	}
 	return 0
 }
 
-func gate() string {
-	if v := os.Getenv("GATE"); v != "" {
+// post asks the running patient to change its gate, from a second process
+// inside the same container.
+func post(path string) int {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Post("http://127.0.0.1:"+port()+path, "", nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "patient: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "patient: %s\n", resp.Status)
+		return 1
+	}
+	return 0
+}
+
+func verdict() string {
+	if check() == 1 {
+		return "sick"
+	}
+	return "ok"
+}
+
+func port() string {
+	if v := os.Getenv("PORT"); v != "" {
 		return v
 	}
-	return "/gate/sick"
+	return "8080"
 }

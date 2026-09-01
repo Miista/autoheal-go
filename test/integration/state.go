@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -193,6 +194,41 @@ func (s *Scenario) WriteCompose(content string) {
 	s.writeFile(filepath.Join(s.Dir, "docker-compose.yml"), content)
 }
 
+// Setting reads a value from the scenario's .env.
+//
+// The same file compose reads when it brings the stack up, so a test asks for
+// the number the subject was actually given rather than repeating it. A test
+// that hardcoded the threshold would keep passing after the fixture changed,
+// while asserting on a number nothing sets.
+func (s *Scenario) Setting(key string) string {
+	s.t.Helper()
+	raw, err := os.ReadFile(filepath.Join(s.Dir, ".env"))
+	if err != nil {
+		s.t.Fatalf("reading %s's .env: %v", s.Name, err)
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if name, value, ok := strings.Cut(line, "="); ok && strings.TrimSpace(name) == key {
+			return strings.TrimSpace(value)
+		}
+	}
+	s.t.Fatalf("%s's .env does not set %s", s.Name, key)
+	return ""
+}
+
+// SettingInt is Setting for a value that is a number.
+func (s *Scenario) SettingInt(key string) int {
+	s.t.Helper()
+	n, err := strconv.Atoi(s.Setting(key))
+	if err != nil {
+		s.t.Fatalf("%s=%q is not a number: %v", key, s.Setting(key), err)
+	}
+	return n
+}
+
 // Health is what docker currently says about a service's container:
 // "healthy", "unhealthy", "starting", or "" when it has no healthcheck.
 func (s *Scenario) Health(service string) string {
@@ -209,50 +245,93 @@ func (s *Scenario) Health(service string) string {
 	return trimmed(out)
 }
 
-// MakeSick trips a patient's gate and returns once docker reports the
-// container unhealthy.
+// State is docker's own word for what a container is doing: "running",
+// "paused", "restarting", "exited".
 //
-// The wait is the point, not a convenience. Tripping the gate only creates a
-// file; docker still has to probe, notice, and change the container's status,
-// and autoheal only acts on that status. A test that returned as soon as the
-// file existed would be racing both of them -- and when it then found the
-// container had not been restarted, it could not tell "autoheal ignored it"
-// from "autoheal was never given the chance".
+// Separate from Health, which is what the healthcheck says. The two are
+// independent: a paused container keeps whatever health status it had when it
+// was paused, and can be both "paused" and "unhealthy" at once.
+func (s *Scenario) State(service string) string {
+	s.t.Helper()
+	id := s.Container(service)
+	if id == "" {
+		return ""
+	}
+	out, err := exec.Command("docker", "inspect", "-f", "{{.State.Status}}", id).Output()
+	if err != nil {
+		return ""
+	}
+	return trimmed(out)
+}
+
+// Pause suspends a service's container and returns once docker says it is
+// paused.
 //
-// Gate files live in the scenario directory, which every patient bind-mounts
-// at /gate.
+// What `docker compose pause` does during a backup: the processes are frozen,
+// not stopped. Waited on for the same reason MakeSick is -- a test that
+// carried on before docker had applied it would be asserting about a container
+// that was still running.
+func (s *Scenario) Pause(service string) {
+	s.t.Helper()
+	if out, err := s.compose("pause", service); err != nil {
+		s.t.Fatalf("pausing %s: %v\n%s", service, err, out)
+	}
+	s.waitFor(service+" to be paused", 30*time.Second,
+		func() bool { return s.State(service) == "paused" },
+		func() string { return service + " is " + s.State(service) })
+}
+
+// Unpause is the mirror of Pause.
+func (s *Scenario) Unpause(service string) {
+	s.t.Helper()
+	if out, err := s.compose("unpause", service); err != nil {
+		s.t.Fatalf("unpausing %s: %v\n%s", service, err, out)
+	}
+	s.waitFor(service+" to be running again", 30*time.Second,
+		func() bool { return s.State(service) == "running" },
+		func() string { return service + " is " + s.State(service) })
+}
+
+// MakeSick tells a patient to report unhealthy, and returns once docker says
+// it is.
+//
+// The wait is the point, not a convenience. The gate only changes what the
+// patient will answer; docker still has to probe, notice, and change the
+// container's status, and autoheal acts on that status alone. A test that
+// returned as soon as the gate was set would be racing both -- and when it
+// then found the container had not been restarted, it could not tell
+// "autoheal ignored it" from "autoheal was never given the chance".
 func (s *Scenario) MakeSick(service string) {
 	s.t.Helper()
-	s.writeGate(service, true)
+	s.gate(service, "sick")
 	s.waitFor(service+" to be reported unhealthy", 60*time.Second,
 		func() bool { return s.Health(service) == "unhealthy" },
 		func() string { return service + " is " + s.Health(service) })
 }
 
-// MakeWell removes the gate and returns once docker reports the container
-// healthy again. The mirror of MakeSick, and waits for the same reason.
+// MakeWell is the mirror of MakeSick, and waits for the same reason.
 func (s *Scenario) MakeWell(service string) {
 	s.t.Helper()
-	s.writeGate(service, false)
+	s.gate(service, "well")
 	s.waitFor(service+" to be reported healthy", 60*time.Second,
 		func() bool { return s.Health(service) == "healthy" },
 		func() string { return service + " is " + s.Health(service) })
 }
 
-// writeGate creates or removes the gate file a patient watches.
-func (s *Scenario) writeGate(service string, sick bool) {
+// gate posts to a patient's control endpoint.
+//
+// Through the container rather than a published port: a fixture would
+// otherwise have to publish one per patient and keep them from colliding,
+// and the scenarios that matter run several patients at once.
+func (s *Scenario) gate(service, action string) {
 	s.t.Helper()
-	path := filepath.Join(s.Dir, "gate", service)
-	if !sick {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			s.t.Fatalf("clearing %s's gate: %v", service, err)
-		}
-		return
+	id := s.Container(service)
+	if id == "" {
+		s.t.Fatalf("no container for %s", service)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o777); err != nil {
-		s.t.Fatalf("preparing the gate directory: %v", err)
-	}
-	if err := os.WriteFile(path, nil, 0o666); err != nil {
-		s.t.Fatalf("tripping %s's gate: %v", service, err)
+	out, err := exec.Command("docker", "exec", id,
+		"/patient", "-post", "/"+action).CombinedOutput()
+	if err != nil {
+		s.t.Fatalf("setting %s %s: %v\n%s", service, action, err, out)
 	}
 }
