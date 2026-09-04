@@ -2,7 +2,10 @@ FROM golang:1.26-alpine AS builder
 WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
-COPY main.go strikes.go log.go ./
+# Every .go in the package root, rather than a list of filenames: naming them
+# individually meant adding a file to the package broke the image build, and
+# broke it at compile time inside docker rather than anywhere obvious.
+COPY *.go ./
 # COVER=1 builds a coverage-instrumented binary, so the integration suite --
 # which exercises autoheal as a real container against a real daemon -- can
 # report coverage that unit tests structurally cannot reach

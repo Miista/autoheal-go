@@ -149,12 +149,21 @@ type containerSummary struct {
 }
 
 // listUnhealthy mirrors get_container_info(): server-side filtered by
-// health=unhealthy, plus the autoheal label (unless set to "all"), plus
-// status=running if AUTOHEAL_ONLY_MONITOR_RUNNING is set.
+// health=unhealthy, plus status=running if AUTOHEAL_ONLY_MONITOR_RUNNING is
+// set, plus -- unless the label is "all" -- the presence of the autoheal
+// label.
+//
+// Presence, not "=true", is deliberate. Filtering on the value server-side
+// means a container whose label says anything else never comes back at all,
+// and a container we never see is one we cannot warn about: the `autoheal:
+// ture` typo of upstream/119 would stay as invisible here as it is upstream.
+// Asking for the label and deciding on its value in runOnce costs one
+// slightly wider response and is what makes a misconfigured container
+// reportable rather than silently unwatched.
 func (d *dockerClient) listUnhealthy(cfg config) ([]containerSummary, error) {
 	filters := map[string][]string{"health": {"unhealthy"}}
 	if cfg.ContainerLabel != "all" {
-		filters["label"] = []string{cfg.ContainerLabel + "=true"}
+		filters["label"] = []string{cfg.ContainerLabel}
 	}
 	if cfg.OnlyMonitorRunning {
 		filters["status"] = []string{"running"}
@@ -306,9 +315,40 @@ func runOnce(log zerolog.Logger, client dockerAPI, cfg config, strikes *strikeTr
 	seenUnhealthy := make(map[string]bool, len(containers))
 
 	for _, c := range containers {
-		if cfg.ContainerLabel != "all" && c.Labels["autoheal"] == "False" {
-			continue
+		// The label decides whether this container is ours to touch. Three
+		// outcomes, and the third is the reason this is a function call and
+		// not an equality test:
+		//
+		//   absent      -- no intent expressed. In "all" mode the default
+		//                  applies and we heal it; in label mode the server
+		//                  side filter meant we never got it at all.
+		//   understood  -- true heals, false leaves it alone, silently. A
+		//                  deliberate exclusion is correct configuration and
+		//                  must not log every poll for as long as it holds.
+		//   present but
+		//   unparseable -- somebody tried to say something and we cannot tell
+		//                  what. Say so and skip: acting on a guess is the
+		//                  irreversible half, and healing a container whose
+		//                  owner may have been trying to exclude it is the
+		//                  wrong way to be wrong.
+		if raw, ok := c.Labels[cfg.labelName()]; ok {
+			want, understood := parseLabelBool(raw)
+			if !understood {
+				if strikes.firstMention(c.ID, "bad-label:"+raw) {
+					log.Error().Msgf("%s has %s=%q, which is not a value I understand — leaving it alone until that is fixed (use true or false)", nameOf(c), cfg.labelName(), raw)
+				}
+				continue
+			}
+			if !want {
+				continue
+			}
 		}
+		// Note both skips above return before seenUnhealthy is recorded below,
+		// so a container we have been told not to touch -- or cannot read the
+		// instructions for -- holds no strike state at all. That is the
+		// difference from the paused case further down, which is deliberately
+		// recorded: a paused container is one of ours that has stopped being
+		// asked, while these were never ours to count.
 		if len(c.Names) == 0 {
 			log.Warn().Msgf("A container (%s) with no name showed up as unhealthy — it likely no longer exists, so leaving it alone", shortID(c.ID))
 			continue
@@ -316,6 +356,31 @@ func runOnce(log zerolog.Logger, client dockerAPI, cfg config, strikes *strikeTr
 		name := strings.TrimPrefix(c.Names[0], "/")
 		shortIDStr := shortID(c.ID)
 		seenUnhealthy[c.ID] = true
+
+		// Same rule as the autoheal label itself: a stop timeout that is
+		// present but unusable is a mistake worth reporting, not something to
+		// quietly paper over with the default. Restarting on a 10s default
+		// when the author asked for 240s is its own kind of wrong -- it is the
+		// complaint in upstream/119, where the label appeared to be ignored --
+		// so we skip rather than guess at how long is safe to allow.
+		//
+		// Checked here, with the other configuration, and deliberately above
+		// the state handling below: everything from "restarting" onward calls
+		// firstMention with the container state, and interleaving a second key
+		// against the same one-slot-per-container record would make the two
+		// alternate and re-log on every poll. Config is settled first, then
+		// state.
+		timeout := cfg.DefaultStopTimeout
+		if v, ok := c.Labels["autoheal.stop.timeout"]; ok {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				if strikes.firstMention(c.ID, "bad-timeout:"+v) {
+					log.Error().Msgf("%s has autoheal.stop.timeout=%q, which is not a whole number of seconds — leaving it alone until that is fixed", name, v)
+				}
+				continue
+			}
+			timeout = n
+		}
 
 		if c.State == "restarting" {
 			log.Info().Msgf("%s is already restarting, so leaving it alone this cycle", name)
@@ -352,13 +417,6 @@ func runOnce(log zerolog.Logger, client dockerAPI, cfg config, strikes *strikeTr
 		// its strike state isn't cleared out from under it while we wait.
 		if strikes.isGivenUp(c.ID) {
 			continue
-		}
-
-		timeout := cfg.DefaultStopTimeout
-		if v, ok := c.Labels["autoheal.stop.timeout"]; ok {
-			if n, err := strconv.Atoi(v); err == nil {
-				timeout = n
-			}
 		}
 
 		log.Info().Msgf("%s is unhealthy — restarting it now (%ds timeout)", name, timeout)

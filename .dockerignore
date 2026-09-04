@@ -1,0 +1,9 @@
+# The image build wants the package source and nothing else. `COPY *.go` would
+# otherwise sweep the test files in too -- go build ignores them, so the binary
+# was never affected, but they invalidate the build cache every time a test
+# changes, which is most commits.
+*_test.go
+test/
+hack/
+coverage.out
+.git/

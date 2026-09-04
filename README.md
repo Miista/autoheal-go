@@ -21,7 +21,7 @@ All upstream variables, unchanged:
 | `WEBHOOK_JSON_KEY` | `text` | The JSON key used above. |
 | `APPRISE_URL` | unset | POSTed `{"title": "Autoheal", "body": "<text>"}`. |
 | `POST_RESTART_SCRIPT` | unset | Run after every successful restart, args: `name shortID state timeoutSeconds`. |
-| `AUTOHEAL_CONTAINER_LABEL` | `autoheal` | Set to `all` to monitor every unhealthy container regardless of label. |
+| `AUTOHEAL_CONTAINER_LABEL` | `autoheal` | The label to read on watched containers. Set to `all` to watch every unhealthy container by default; see [Container labels](#container-labels). |
 | `AUTOHEAL_START_PERIOD` | `0` (seconds) | Delay before the first check. |
 | `AUTOHEAL_INTERVAL` | `5` (seconds) | Poll interval. |
 | `AUTOHEAL_DEFAULT_STOP_TIMEOUT` | `10` (seconds) | Restart timeout; overridable per-container via the `autoheal.stop.timeout` label. |
@@ -37,6 +37,73 @@ New in this rewrite:
 | `NTFY_URL` | unset | Full [ntfy](https://ntfy.sh) topic URL, e.g. `https://ntfy.sh/mytopic`. Sends a plain-text message, not JSON. |
 | `NTFY_TOKEN` | unset | Bearer token for `NTFY_URL`, sent as a proper `Authorization` header. Omit for a public topic. |
 
+## Container labels
+
+Whether a container is autoheal's to restart is decided by a label on **that
+container** (`AUTOHEAL_CONTAINER_LABEL` is an environment variable on the
+autoheal container, and names the label to look for — it is never itself a
+label on a watched container).
+
+Below, "the label" means the one `AUTOHEAL_CONTAINER_LABEL` names — `autoheal`
+unless you changed it, and `autoheal` in `all` mode too, since `all` is a mode
+rather than a label name.
+
+| Label | `AUTOHEAL_CONTAINER_LABEL=all` | Default (label) mode |
+|---|---|---|
+| absent | **restarted** — `all` means everything is in by default | ignored, never even named in the log |
+| `true` `True` `1` `yes` `on` | restarted | **restarted** |
+| `false` `False` `0` `no` `off` | **left alone**, silently | left alone, silently |
+| anything else | **left alone, and logged as an error** | left alone, and logged as an error |
+
+Both capitalisations are accepted on purpose. `docker compose` coerces an
+unquoted YAML boolean, so `autoheal: true` reaches Docker as the string
+`"True"` while `autoheal: "true"` stays lowercase — the same intent written two
+ways, and upstream honouring only one of them is the whole of
+[upstream #110](https://github.com/willfarrell/docker-autoheal/issues/110) and
+[#46](https://github.com/willfarrell/docker-autoheal/issues/46).
+
+Excluding a container with `autoheal=false` works in `all` mode, which is the
+point of it — opting one container out of a hundred rather than labelling the
+other ninety-nine in
+([upstream #126](https://github.com/willfarrell/docker-autoheal/issues/126),
+[#73](https://github.com/willfarrell/docker-autoheal/issues/73)).
+
+### Unreadable configuration is refused, not guessed at
+
+A label that is **present but not one of the values above** — `ture`, `falsch`,
+`maybe` — is a mistake somebody made while trying to say something, and
+autoheal-go will not guess which. The container is left alone and the problem
+is logged once, when it is first seen:
+
+```
+container-name has autoheal="ture", which is not a value I understand — leaving it alone until that is fixed (use true or false)
+```
+
+The same applies to `autoheal.stop.timeout`: a value that is not a whole number
+of seconds skips the container rather than silently falling back to
+`AUTOHEAL_DEFAULT_STOP_TIMEOUT`. Restarting on a 10-second default when the
+author asked for `240` is its own kind of wrong, and is what
+[upstream #119](https://github.com/willfarrell/docker-autoheal/issues/119)
+reports as the label "not working".
+
+Absence is not a fault — a container with no label at all has expressed no
+intent, and in `all` mode the default still applies to it. Only a value that is
+there and unreadable is refused.
+
+One consequence worth knowing: because `AUTOHEAL_CONTAINER_LABEL` carries both
+meanings — a label name, or the mode `all` — setting it to `all` leaves no
+label name configured, and the conventional `autoheal` is read for exclusions.
+So a custom label name and `all` mode cannot currently be combined. Upstream
+overloads the variable the same way; separating the two would need a new
+variable and is deliberately not done here, to keep existing compose files
+working unchanged.
+
+**Note for `all`-mode upgrades:** a container carrying a misspelled label is
+restarted by upstream (and by earlier builds of this port) and is *not*
+restarted here. That is deliberate — healing something whose owner may have
+been trying to exclude it is the wrong way to be wrong — but it is a behaviour
+change, and the error log is how you find the containers it applies to.
+
 ## Crash-loop behavior
 
 Once a container crosses `AUTOHEAL_CRASHLOOP_STRIKES` consecutive restarts
@@ -49,9 +116,20 @@ crash-loop behavior resumes on any future relapse.
 ## Drop-in compatibility
 
 Same env vars, same defaults as `willfarrell/autoheal:1.2.0`; the extra
-vars above are additive and no-ops when unset. Two cosmetic-only
-differences: log line format, and how a nameless container is detected
-internally (same outcome either way).
+vars above are additive and no-ops when unset. `AUTOHEAL_CONTAINER_LABEL`
+keeps upstream's double duty — normally the name of the label to read, with
+`all` reserved as a mode — rather than splitting the two apart, so an existing
+compose file needs no edit.
+
+Two cosmetic-only differences: log line format, and how a nameless container is
+detected internally (same outcome either way).
+
+One deliberate behavioural difference: a container whose label is present but
+unreadable is left alone and reported, where upstream restarts it (in `all`
+mode) or silently ignores it (in label mode). See [Container
+labels](#container-labels). Correct configuration behaves identically to
+upstream in both modes; only a value neither of us can read is treated
+differently.
 
 ## Building
 

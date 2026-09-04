@@ -1,0 +1,73 @@
+# The label table under AUTOHEAL_CONTAINER_LABEL=all, against a real daemon.
+#
+# all-mode is where the exclusion label earns its keep (upstream/126,
+# upstream/73): the point of the mode is not labelling ninety-nine containers
+# to opt them in, so opting one out has to work. Every patient here is made
+# genuinely sick by the test, so the only thing separating them is the label.
+#
+# The values are the ones docker compose actually produces. An unquoted YAML
+# boolean reaches docker capitalised -- `autoheal: true` becomes "True" -- and
+# quoting it keeps it lowercase, so both spellings of both booleans appear
+# below and all four must be understood.
+services:
+  # No label at all. In all-mode that is not a misconfiguration, it is the
+  # default, and it must still be healed.
+  unlabelled:
+    image: autoheal-patient:integration
+
+  # Redundant in this mode, and harmless.
+  explicit-true:
+    image: autoheal-patient:integration
+    labels:
+      autoheal: "true"
+
+  # What `autoheal: true` unquoted turns into.
+  capital-true:
+    image: autoheal-patient:integration
+    labels:
+      autoheal: "True"
+
+  # The opt-out, and the reason this fixture exists.
+  explicit-false:
+    image: autoheal-patient:integration
+    labels:
+      autoheal: "false"
+
+  # What `autoheal: false` unquoted turns into. Upstream's README documented
+  # the lowercase spelling while its code only tested for this one.
+  capital-false:
+    image: autoheal-patient:integration
+    labels:
+      autoheal: "False"
+
+  # Present and meaningless. Reaching for false in German and missing: must be
+  # skipped and reported, never healed on the grounds that it was not a
+  # recognised "false".
+  gibberish:
+    image: autoheal-patient:integration
+    labels:
+      autoheal: "falsch"
+
+  # The literal typo of upstream/119.
+  typo:
+    image: autoheal-patient:integration
+    labels:
+      autoheal: "ture"
+
+  # Opted in, but with a stop timeout that is not a number. The heal itself is
+  # configured wrong, so it is skipped rather than run on a guessed default.
+  bad-timeout:
+    image: autoheal-patient:integration
+    labels:
+      autoheal: "true"
+      autoheal.stop.timeout: "4min"
+
+  autoheal:
+    image: autoheal:integration
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: "all"
+      AUTOHEAL_INTERVAL: "1"
+      AUTOHEAL_START_PERIOD: "0"
+      LOG_LEVEL: debug
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

@@ -1,0 +1,53 @@
+# The same table in the default mode, where AUTOHEAL_CONTAINER_LABEL names the
+# label rather than meaning "everything".
+#
+# The mode changes what absence means -- here a container with no label is
+# simply not autoheal's business -- but not what a present value means. The
+# interesting property is that a container labelled with a value we cannot read
+# is still seen at all: the daemon-side filter matches on the label existing,
+# not on its value, precisely so a typo can be reported instead of silently
+# dropping the container out of view.
+services:
+  # Opted in the ordinary way.
+  explicit-true:
+    image: autoheal-patient:integration
+    labels:
+      autoheal: "true"
+
+  # Unquoted-YAML spelling of the same thing.
+  capital-true:
+    image: autoheal-patient:integration
+    labels:
+      autoheal: "True"
+
+  # Explicitly opted out while still carrying the label.
+  explicit-false:
+    image: autoheal-patient:integration
+    labels:
+      autoheal: "false"
+
+  capital-false:
+    image: autoheal-patient:integration
+    labels:
+      autoheal: "False"
+
+  # The typo that upstream never sees, because filtering on label=autoheal=true
+  # server-side hides it. It has to reach us to be reported.
+  typo:
+    image: autoheal-patient:integration
+    labels:
+      autoheal: "ture"
+
+  # No label: genuinely none of autoheal's business in this mode.
+  unlabelled:
+    image: autoheal-patient:integration
+
+  autoheal:
+    image: autoheal:integration
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: "autoheal"
+      AUTOHEAL_INTERVAL: "1"
+      AUTOHEAL_START_PERIOD: "0"
+      LOG_LEVEL: debug
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
