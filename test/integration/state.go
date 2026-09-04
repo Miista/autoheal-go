@@ -335,3 +335,29 @@ func (s *Scenario) gate(service, action string) {
 		s.t.Fatalf("setting %s %s: %v\n%s", service, action, err, out)
 	}
 }
+
+// Notifications returns what the receiver has been sent, one entry per
+// notification, in arrival order.
+//
+// Read from the file the receiver appends to rather than from its logs: a
+// notification is a request that was made, and the file is the record of it
+// that survives the container being restarted or the test reading twice.
+func (s *Scenario) Notifications() []string {
+	s.t.Helper()
+	raw, err := os.ReadFile(filepath.Join(s.Dir, "data", "requests.log"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Nothing has been sent yet. Not an error -- most of the waiting
+			// in these scenarios is for the first notification to arrive.
+			return nil
+		}
+		s.t.Fatalf("reading the notification log: %v", err)
+	}
+	var out []string
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}

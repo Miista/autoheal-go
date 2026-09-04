@@ -19,15 +19,19 @@ type fakeDockerAPI struct {
 	restartErr map[string]error // container ID -> error
 	healthy    map[string]bool  // container ID -> isHealthy() result
 	healthErr  map[string]error
+	// healthOutput is what the container's healthcheck last printed, as
+	// lastHealthOutput would report it.
+	healthOutput map[string]string
 
 	restarted []string // container IDs, in call order
 }
 
 func newFakeDockerAPI() *fakeDockerAPI {
 	return &fakeDockerAPI{
-		restartErr: map[string]error{},
-		healthy:    map[string]bool{},
-		healthErr:  map[string]error{},
+		restartErr:   map[string]error{},
+		healthy:      map[string]bool{},
+		healthErr:    map[string]error{},
+		healthOutput: map[string]string{},
 	}
 }
 
@@ -41,6 +45,10 @@ func (f *fakeDockerAPI) listUnhealthy(config) ([]containerSummary, error) {
 func (f *fakeDockerAPI) restart(containerID string, _ int) error {
 	f.restarted = append(f.restarted, containerID)
 	return f.restartErr[containerID]
+}
+
+func (f *fakeDockerAPI) lastHealthOutput(containerID string) string {
+	return f.healthOutput[containerID]
 }
 
 func (f *fakeDockerAPI) isHealthy(containerID string) (bool, error) {

@@ -10,3 +10,10 @@ dist/
 # covered too.
 /testbed*/
 coverage.out
+
+# The suite's helper programs, when built directly rather than into their
+# images -- `go build ./test/integration/patient/` drops one here, and it is
+# the sort of thing that gets committed in a hurry.
+/patient
+/receiver
+/sandbox

@@ -36,6 +36,7 @@ New in this rewrite:
 | `TZ` | unset (UTC) | IANA zone name, e.g. `Europe/Stockholm`, for local log timestamps. |
 | `NTFY_URL` | unset | Full [ntfy](https://ntfy.sh) topic URL, e.g. `https://ntfy.sh/mytopic`. Sends a plain-text message, not JSON. |
 | `NTFY_TOKEN` | unset | Bearer token for `NTFY_URL`, sent as a proper `Authorization` header. Omit for a public topic. |
+| `AUTOHEAL_NOTIFY_PREFIX` | the hostname | Stamped on every notification so alerts say which host they came from. Set to an empty string to turn it off. |
 
 ## Container labels
 
@@ -103,6 +104,31 @@ restarted by upstream (and by earlier builds of this port) and is *not*
 restarted here. That is deliberate — healing something whose owner may have
 been trying to exclude it is the wrong way to be wrong — but it is a behaviour
 change, and the error log is how you find the containers it applies to.
+
+## What a notification says
+
+Notifications name the host and carry the healthcheck's own explanation, so an
+alert can be acted on without going to the machine to find out what happened:
+
+```
+[prod-db-1] nginx (a1b2c3d4e5f6) was unhealthy and has been restarted. The last healthcheck said: curl: (7) Failed to connect to localhost port 8080
+```
+
+- **Which host** — container names repeat across machines, and an alert about
+  `nginx` restarting does not say which `nginx`
+  ([upstream #118](https://github.com/willfarrell/docker-autoheal/issues/118)).
+  `AUTOHEAL_NOTIFY_PREFIX` overrides the hostname; an empty string turns it off.
+- **Why** — the healthcheck already worked out the diagnosis and it was being
+  thrown away
+  ([upstream #81](https://github.com/willfarrell/docker-autoheal/issues/81)).
+  The first line of its last output is included, trimmed to 200 characters. A
+  healthcheck that prints nothing (a bare `exit 1`) leaves the clause off
+  rather than trailing an empty one. Read before the restart, since afterwards
+  the health log belongs to the new process.
+- **What went wrong, when it did** — a failed restart quotes the daemon's own
+  message (`No such container`, `device or resource busy`) instead of a bare
+  status code
+  ([upstream #111](https://github.com/willfarrell/docker-autoheal/issues/111)).
 
 ## Crash-loop behavior
 

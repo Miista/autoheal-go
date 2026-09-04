@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -44,6 +45,7 @@ type config struct {
 	AppriseURL               string
 	NtfyURL                  string
 	NtfyToken                string
+	NotifyPrefix             string
 	PostRestartScript        string
 	ContainerLabel           string
 	StartPeriod              time.Duration
@@ -62,6 +64,7 @@ func loadConfig(log zerolog.Logger) config {
 		AppriseURL:               os.Getenv("APPRISE_URL"),
 		NtfyURL:                  os.Getenv("NTFY_URL"),
 		NtfyToken:                os.Getenv("NTFY_TOKEN"),
+		NotifyPrefix:             notifyPrefix(log),
 		PostRestartScript:        os.Getenv("POST_RESTART_SCRIPT"),
 		ContainerLabel:           getEnv("AUTOHEAL_CONTAINER_LABEL", "autoheal"),
 		StartPeriod:              time.Duration(getEnvInt(log, "AUTOHEAL_START_PERIOD", 0)) * time.Second,
@@ -102,6 +105,7 @@ type dockerAPI interface {
 	listUnhealthy(cfg config) ([]containerSummary, error)
 	restart(containerID string, timeoutSeconds int) error
 	isHealthy(containerID string) (bool, error)
+	lastHealthOutput(containerID string) string
 }
 
 // dockerClient talks to the Docker Engine API the same way upstream's
@@ -247,6 +251,51 @@ func (d *dockerClient) isHealthy(containerID string) (bool, error) {
 	return detail.State.Health.Status == "healthy", nil
 }
 
+// lastHealthOutput returns what the container's healthcheck said the last time
+// it ran, trimmed to something that fits in an alert.
+//
+// "nginx is unhealthy and has been restarted" tells an operator nothing about
+// why; the healthcheck already produced the diagnosis and it was being thrown
+// away (upstream/81). Docker keeps the last few probe results in
+// State.Health.Log, most recent last, each with the command's output and exit
+// code.
+//
+// Best effort, and deliberately not an error return: this decorates a
+// notification that is going out either way, and failing to read it must never
+// stop the notification or turn into a second error to report.
+func (d *dockerClient) lastHealthOutput(containerID string) string {
+	url := fmt.Sprintf("%s/containers/%s/json", d.endpoint, containerID)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var detail struct {
+		State struct {
+			Health *struct {
+				Log []struct {
+					ExitCode int    `json:"ExitCode"`
+					Output   string `json:"Output"`
+				} `json:"Log"`
+			} `json:"Health"`
+		} `json:"State"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+		return ""
+	}
+	if detail.State.Health == nil || len(detail.State.Health.Log) == 0 {
+		return ""
+	}
+	return summarizeHealthOutput(detail.State.Health.Log[len(detail.State.Health.Log)-1].Output)
+}
+
 // restart mirrors restart_container(): POST /containers/{id}/restart?t=timeout.
 func (d *dockerClient) restart(containerID string, timeoutSeconds int) error {
 	url := fmt.Sprintf("%s/containers/%s/restart?t=%d", d.endpoint, containerID, timeoutSeconds)
@@ -260,9 +309,37 @@ func (d *dockerClient) restart(containerID string, timeoutSeconds int) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("docker API returned %d restarting %s", resp.StatusCode, containerID)
+		return fmt.Errorf("docker API returned %d restarting %s: %s",
+			resp.StatusCode, containerID, dockerErrorMessage(resp.Body))
 	}
 	return nil
+}
+
+// dockerErrorMessage pulls the human-readable half out of a Docker error
+// response. The daemon explains itself in the body -- {"message":"No such
+// container: ..."} -- and throwing that away left "docker API returned 500"
+// as the entire diagnosis, which is upstream/111 asking how to find out why a
+// restart failed. There is no way to answer that from a status code.
+//
+// Best-effort by design: this is already the error path, and a body that is
+// missing, truncated or not JSON must not turn a failed restart into a
+// different, more confusing failure. Anything unreadable falls back to a
+// description of what was there.
+func dockerErrorMessage(body io.Reader) string {
+	raw, err := io.ReadAll(io.LimitReader(body, 8<<10))
+	if err != nil {
+		return "unreadable response body"
+	}
+	var payload struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &payload); err == nil && payload.Message != "" {
+		return payload.Message
+	}
+	if text := strings.TrimSpace(string(raw)); text != "" {
+		return text
+	}
+	return "no detail given"
 }
 
 func main() {
@@ -419,15 +496,28 @@ func runOnce(log zerolog.Logger, client dockerAPI, cfg config, strikes *strikeTr
 			continue
 		}
 
+		// Read before restarting: once the container comes back its health log
+		// belongs to the new process, and whatever it said while failing --
+		// the thing worth putting in the alert -- is gone.
+		because := client.lastHealthOutput(c.ID)
+
 		log.Info().Msgf("%s is unhealthy — restarting it now (%ds timeout)", name, timeout)
 		if err := client.restart(c.ID, timeout); err != nil {
 			log.Error().Err(err).Msgf("Tried to restart %s but the restart itself failed", name)
-			go notify(log, cfg, fmt.Sprintf("%s (%s) is unhealthy and the restart attempt failed.", name, shortIDStr))
+			// The reason travels with the alert, not just the log. Somebody
+			// reading "the restart failed" on their phone cannot go and grep,
+			// and the daemon's own message is usually the whole diagnosis
+			// ("No such container", "device or resource busy").
+			go notify(log, cfg, withHealthOutput(
+				fmt.Sprintf("%s (%s) is unhealthy and the restart attempt failed: %s", name, shortIDStr, err),
+				because))
 			continue
 		}
 
 		log.Info().Msgf("Restarted %s successfully", name)
-		go notify(log, cfg, fmt.Sprintf("%s (%s) was unhealthy and has been restarted.", name, shortIDStr))
+		go notify(log, cfg, withHealthOutput(
+			fmt.Sprintf("%s (%s) was unhealthy and has been restarted.", name, shortIDStr),
+			because))
 		go runPostRestartScript(log, cfg, name, shortIDStr, c.State, timeout)
 
 		// Crash-loop tracking: only increments when unhealthy AND we just
@@ -480,6 +570,15 @@ func shortID(id string) string {
 func notify(log zerolog.Logger, cfg config, text string) {
 	if cfg.WebhookURL == "" && cfg.AppriseURL == "" && cfg.NtfyURL == "" {
 		return
+	}
+	// Which machine is this? Container names repeat across hosts -- everybody
+	// has an `nginx` -- so an alert saying one was restarted does not say
+	// where, and upstream/118 is somebody running autoheal on several hosts
+	// unable to tell the notifications apart. Only the notification is
+	// prefixed: the log is already read in the context of the host it came
+	// from, so stamping every line there would be noise.
+	if cfg.NotifyPrefix != "" {
+		text = "[" + cfg.NotifyPrefix + "] " + text
 	}
 	log.Debug().Msgf("Sending notification: %s", text)
 	if cfg.WebhookURL != "" {

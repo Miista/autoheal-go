@@ -1,0 +1,32 @@
+# What a notification actually says, with something on the other end of the
+# request to read it.
+#
+# The unit tests fake the notifier, so what they cannot show is the text that
+# leaves the process: whether the host stamp survives the round trip, and
+# whether the healthcheck's own words arrive with it. That needs a real POST to
+# a real listener.
+services:
+  # Fails its healthcheck with a specific, recognisable message, so a test can
+  # tell "the healthcheck output arrived" from "some text arrived".
+  noisy:
+    image: autoheal-patient:integration
+    labels:
+      autoheal: "true"
+
+  receiver:
+    image: autoheal-receiver:integration
+    volumes:
+      - ./data:/log
+
+  autoheal:
+    image: autoheal:integration
+    environment:
+      AUTOHEAL_INTERVAL: "1"
+      AUTOHEAL_START_PERIOD: "0"
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: "1"
+      AUTOHEAL_NOTIFY_PREFIX: "test-host"
+      WEBHOOK_URL: "http://receiver:8080/"
+      WEBHOOK_JSON_KEY: "text"
+      LOG_LEVEL: debug
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

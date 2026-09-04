@@ -87,8 +87,17 @@ func set(sick bool) http.HandlerFunc {
 // check is what the image's HEALTHCHECK runs. It reads the gate directly
 // rather than asking the server, so a wedged server is unhealthy rather than
 // reported as whatever it last said.
+//
+// A failing probe says why, on stdout, the way a real healthcheck does --
+// `curl: (7) Failed to connect`. Docker keeps that text in State.Health.Log
+// and autoheal puts it in the notification (upstream/81), so a scenario
+// asserting the notification explains itself needs a patient that explains
+// itself. The wording is deliberately distinctive: a test matching on it is
+// then matching on the healthcheck's own words rather than on any text that
+// happened to arrive.
 func check() int {
 	if _, err := os.Stat(gatePath); err == nil {
+		fmt.Println("patient: the gate is closed, refusing connections")
 		return 1
 	}
 	return 0
