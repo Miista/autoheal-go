@@ -139,6 +139,32 @@ checking that container's health every cycle regardless — once confirmed
 genuinely healthy again, the strike count clears and normal restart/
 crash-loop behavior resumes on any future relapse.
 
+### Stopping a container to investigate it
+
+A container you stop by hand stays in Docker's unhealthy list — stopping it
+freezes its health at whatever it last reported, it does not clear it — so
+autoheal sees an unhealthy container and starts it again, out from under you
+([upstream #22](https://github.com/willfarrell/docker-autoheal/issues/22)).
+
+There is no flag on a stopped container saying who stopped it. `exited` looks
+the same whether an admin ran `docker stop`, the process crashed, or it was
+OOM-killed — and restarting it is the whole point of autoheal in the latter
+two. So this is not something autoheal-go decides for you. Three ways to get
+what you want, in rough order of how narrow they are:
+
+- **`autoheal=false` on that container.** Takes it out of scope entirely until
+  you take the label off. The narrowest option and the one to reach for if the
+  container is going to sit stopped for a while.
+- **`AUTOHEAL_ONLY_MONITOR_RUNNING=true`.** Autoheal then only considers
+  containers currently `running`, so anything stopped is left alone —
+  including containers that died and would otherwise have been restarted.
+  A host-wide setting, so it changes the answer for everything.
+- **Nothing.** The crash-loop behaviour above is usually the reason people
+  reach for this: a container restarting forever is exactly what
+  `AUTOHEAL_CRASHLOOP_STRIKES` stops, and once autoheal has given up on a
+  container it will not restart it again until it is confirmed healthy. You
+  can stop it and take your time.
+
 ## Drop-in compatibility
 
 Same env vars, same defaults as `willfarrell/autoheal:1.2.0`; the extra
