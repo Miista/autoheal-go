@@ -106,6 +106,13 @@ func Up(t T, name string) *Scenario {
 	}
 	s.copyTree(src, s.Dir)
 
+	// A fixture that mounts a compose binary into the subject needs two values
+	// this process only knows at runtime: where this host keeps its compose
+	// plugin, and the testbed's own path (which has to appear inside the
+	// container unchanged -- see recreate.go). Written here, before anything
+	// is brought up, because the subject reads its mounts as it starts.
+	s.enableRecreateIfDeclared()
+
 	// The subject's state directory. Docker would create it as a side effect of the
 	// bind mount, but only when its parent already exists -- so whether it
 	// worked depended on what a previous test happened to leave behind.

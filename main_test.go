@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,6 +25,12 @@ type fakeDockerAPI struct {
 	healthOutput map[string]string
 
 	restarted []string // container IDs, in call order
+
+	// newIDs maps a container name to the ID its replacement gets, standing in
+	// for what a real recreate produces. Unset means the lookup fails, which
+	// is the "recreated but couldn't find the new ID" path.
+	newIDs   map[string]string
+	lookedUp []string // container names passed to containerID(), in call order
 }
 
 func newFakeDockerAPI() *fakeDockerAPI {
@@ -32,7 +39,16 @@ func newFakeDockerAPI() *fakeDockerAPI {
 		healthy:      map[string]bool{},
 		healthErr:    map[string]error{},
 		healthOutput: map[string]string{},
+		newIDs:       map[string]string{},
 	}
+}
+
+func (f *fakeDockerAPI) containerID(name string) (string, error) {
+	f.lookedUp = append(f.lookedUp, name)
+	if id, ok := f.newIDs[name]; ok {
+		return id, nil
+	}
+	return "", errors.New("No such container: " + name)
 }
 
 func (f *fakeDockerAPI) listUnhealthy(config) ([]containerSummary, error) {

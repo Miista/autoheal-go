@@ -124,3 +124,33 @@ func (s *strikeTracker) clear(containerID string) {
 	// again later, that is a new event and worth saying so.
 	delete(s.mentioned, containerID)
 }
+
+// transfer moves all strike state from one container ID to another.
+//
+// Recreating a container produces a new object with a new ID, so without this
+// the history would be left behind on an ID that no longer exists: the old
+// entry would never clear (the recovery check asks Docker about a container it
+// cannot find), and -- the part that matters -- the replacement would start at
+// zero strikes every cycle, so a service that recreates and fails, recreates
+// and fails, would never be recognised as a crash loop. Carrying the count
+// across is what makes AUTOHEAL_CRASHLOOP_STRIKES mean the same thing in both
+// heal modes.
+func (s *strikeTracker) transfer(oldID, newID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if oldID == newID {
+		return
+	}
+	if n, ok := s.counts[oldID]; ok {
+		s.counts[newID] = n
+		delete(s.counts, oldID)
+	}
+	if s.givenUp[oldID] {
+		s.givenUp[newID] = true
+		delete(s.givenUp, oldID)
+	}
+	// Deliberately not carried: mentioned is keyed to states the old container
+	// was observed in, and the replacement has not been seen in any of them
+	// yet. A fresh container earning a fresh "is paused" line is correct.
+	delete(s.mentioned, oldID)
+}

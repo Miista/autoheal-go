@@ -80,6 +80,65 @@ is logged once, when it is first seen:
 container-name has autoheal="ture", which is not a value I understand — leaving it alone until that is fixed (use true or false)
 ```
 
+### Restarting or recreating
+
+`autoheal.mode` on a watched container chooses how it is healed:
+
+| Value | Meaning |
+|---|---|
+| absent, `restart` | `docker restart` — stop and start the same container. The default, and what upstream does. |
+| `recreate` | `docker compose up -d --force-recreate <service>` — rebuild the container from its compose file. |
+| anything else | left alone, and logged as an error (same rule as the `autoheal` label above) |
+
+**Recreate exists because a restart cannot fix a container whose stored
+configuration has gone stale.** The case it was written for is
+`network_mode: service:<other>`: docker resolves that to a concrete container
+ID once, when the container is created, and stores it. Recreate the peer — a
+VPN sidecar being updated, say — and the ID it points at no longer exists. A
+restart replays the same stored ID and fails with `No such container` every
+time, so the container sits at `Exited (128)` while autoheal retries and gets
+nowhere. Only rebuilding from the compose file re-resolves the peer.
+
+There is no recreate endpoint in the Docker API, and there cannot be one: the
+daemon stores a container's finished configuration, not the desired state it
+came from. The compose file lives on the client's disk and the daemon has
+never seen it. So recreate runs compose, and needs two mounts:
+
+```yaml
+autoheal:
+  image: ghcr.io/miista/autoheal-go:latest
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    # The host's own compose plugin. Mounted rather than shipped so the
+    # version always matches the host's -- compose computes the config hash
+    # that decides what a recreate produces.
+    - /usr/libexec/docker/cli-plugins/docker-compose:/docker-compose:ro
+    # The project directory, at the SAME path it has on the host.
+    - /home/you/docker/myproject:/home/you/docker/myproject:ro
+```
+
+The project path has to match the host's, because compose resolves `.env`
+files, relative bind mounts and `include:` against it — a translated path
+would not fail, it would silently resolve to a different configuration and
+rebuild the container wrong. Read-only is enough; compose writes nothing to
+the project.
+
+Everything else is read from the container's own
+`com.docker.compose.*` labels, so there is nothing to configure per container
+and no project path to tell autoheal about. A container that was not created
+by compose has no compose file to rebuild it from, and is reported rather than
+guessed at — as is a project directory that is not mounted, which compose
+would otherwise describe as a missing file.
+
+The compose binary Docker ships is statically linked, so it runs in this
+image's `FROM scratch` container with no shell and no docker CLI. Verified
+against compose v5.1.4 and v5.5.1.
+
+Crash-loop strikes follow the container across a recreate. Rebuilding gives
+the service a new container ID, and a count keyed on the old one would restart
+from zero every cycle — so a service that recreates and fails forever would
+never be recognised as a crash loop.
+
 The same applies to `autoheal.stop.timeout`: a value that is not a whole number
 of seconds skips the container rather than silently falling back to
 `AUTOHEAL_DEFAULT_STOP_TIMEOUT`. Restarting on a 10-second default when the
@@ -195,11 +254,21 @@ package manager in the final image.
 ## Testing
 
 ```sh
-go test ./... -cover   # unit tests: strike tracking + restart/give-up/clear logic
-hack/e2e.sh             # builds the real image, runs it against a real target container
+make test-unit          # needs nothing but Go
+make test-integration   # needs docker; runs everything locally, works offline
+make test               # both
 ```
 
-`hack/e2e.sh` needs Docker and covers: an unhealthy container being
-restarted and recovering, a crash-looping container getting notified,
-restarts stopping once past the strike threshold, and a given-up
-container recovering and resuming normal behavior on a later relapse.
+The integration suite in `test/integration` builds the real shipped image and
+runs it against real containers, one compose fixture per behaviour
+(`hack/fixtures/`). It covers: an unhealthy container being restarted and
+recovering, a healthy one being left alone, recreate mode replacing the
+container where restart mode keeps it, crash-loop detection (including across
+the new container IDs a recreate produces), paused and unlabelled containers,
+label parsing, and notification content.
+
+The recreate scenarios need a Linux compose binary to mount into the subject.
+On Linux the host's own plugin is used, which is what a real deployment does;
+on macOS, where the Docker Desktop CLI is a Mach-O binary that cannot run in a
+Linux container, one is extracted from `docker/compose-bin` and cached under
+`testbed/`.

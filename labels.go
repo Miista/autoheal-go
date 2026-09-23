@@ -57,3 +57,98 @@ func (c config) labelName() string {
 	}
 	return c.ContainerLabel
 }
+
+// healMode is how a container asks to be healed: restarted in place, or
+// destroyed and rebuilt from its compose file.
+//
+// Restart is the default and the only mode upstream has. It is `docker
+// restart` -- stop and start the same container object -- and it is the right
+// answer for a process that has wedged.
+//
+// Recreate exists because restart cannot fix a container whose configuration
+// has gone stale, and the case that forced it is network_mode:
+// service:<vpn-container>. Docker resolves that to a concrete container ID
+// once, at creation, and stores it; when the VPN container is recreated the ID
+// it points at no longer exists. A restart replays the same stored ID and
+// fails with "No such container" every time -- observed as qbittorrent sitting
+// at Exited(128) while autoheal retried and got nowhere. Only rebuilding the
+// container from the compose file re-resolves the peer.
+type healMode int
+
+const (
+	healRestart healMode = iota
+	healRecreate
+)
+
+func (m healMode) String() string {
+	if m == healRecreate {
+		return "recreate"
+	}
+	return "restart"
+}
+
+// parseHealMode reads the autoheal.mode label. Absent means restart, which
+// keeps every existing compose file behaving exactly as it did.
+//
+// An unreadable value is refused rather than defaulted, for the same reason
+// parseLabelBool refuses one: somebody wrote it meaning something, and
+// quietly restarting a container whose owner asked for a recreate would
+// reproduce the exact failure the label exists to fix.
+func parseHealMode(v string) (mode healMode, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "restart":
+		return healRestart, true
+	case "recreate":
+		return healRecreate, true
+	default:
+		return healRestart, false
+	}
+}
+
+// composeProject is the compose invocation recovered from a container's own
+// labels. Compose stamps these at creation, so a container carries everything
+// needed to rebuild it and autoheal needs no configuration of its own -- no
+// project path env var, no per-container settings.
+type composeProject struct {
+	Name        string
+	WorkingDir  string
+	ConfigFiles []string
+	Service     string
+}
+
+// composeProjectFrom recovers the compose invocation from container labels.
+//
+// ConfigFiles is documented as comma-separated when a project has several
+// files; a single-file project is the common case and `include:` is resolved
+// by compose rather than listed here.
+//
+// Missing labels mean the container was not created by compose -- a plain
+// `docker run` -- and there is no compose file to rebuild it from. That is
+// reported rather than guessed at.
+func composeProjectFrom(labels map[string]string) (composeProject, bool) {
+	p := composeProject{
+		Name:       labels["com.docker.compose.project"],
+		WorkingDir: labels["com.docker.compose.project.working_dir"],
+		Service:    labels["com.docker.compose.service"],
+	}
+	for _, f := range strings.Split(labels["com.docker.compose.project.config_files"], ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			p.ConfigFiles = append(p.ConfigFiles, f)
+		}
+	}
+	if p.Name == "" || p.WorkingDir == "" || p.Service == "" || len(p.ConfigFiles) == 0 {
+		return composeProject{}, false
+	}
+	return p, true
+}
+
+// args builds the compose command line. The paths are the host's, taken
+// verbatim from the labels, which is why the project directory must be bind
+// mounted into this container at the identical path -- see recreate().
+func (p composeProject) args() []string {
+	args := []string{"--project-name", p.Name, "--project-directory", p.WorkingDir}
+	for _, f := range p.ConfigFiles {
+		args = append(args, "-f", f)
+	}
+	return append(args, "up", "-d", "--force-recreate", p.Service)
+}

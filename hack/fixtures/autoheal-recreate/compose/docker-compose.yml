@@ -1,0 +1,74 @@
+# Recreating, rather than restarting, an unhealthy container.
+#
+# The scenario this exists for: a container whose stored configuration has
+# gone stale -- network_mode: service:<other>, where the peer has been
+# recreated and the stored container id no longer resolves. Restarting replays
+# the same stale id and fails forever; only rebuilding from the compose file
+# fixes it. See recreate.go.
+#
+# Two mounts make that possible, and they are what this fixture is really
+# testing:
+#
+#   the compose binary, from the host (COMPOSE_BIN, supplied by the harness)
+#   the project directory, at the SAME path it has on the host (PROJECT_DIR)
+#
+# The project path has to match because compose resolves .env files, relative
+# binds and include: against it -- a translated path would silently resolve to
+# a different configuration rather than fail.
+services:
+  # Labelled for recreate: autoheal must rebuild it, not restart it.
+  sick:
+    image: autoheal-patient:integration
+    labels:
+      autoheal: "true"
+      autoheal.mode: "recreate"
+
+  # The control. Identical but for the mode, so a test can tell "recreate
+  # happened" apart from "anything happened at all": this one keeps its
+  # container id, that one must not.
+  sick-restart:
+    image: autoheal-patient:integration
+    labels:
+      autoheal: "true"
+      autoheal.mode: "restart"
+
+  # The crash-loop patient, kept separate from "sick" because its gate has to
+  # survive being rebuilt. A recreate replaces the container and its writable
+  # layer, so a gate at the default path is wiped and the patient comes back
+  # well -- which would make a crash loop look like a recovery. On a mounted
+  # volume it stays sick however many times it is rebuilt, which is what a
+  # crash loop actually is.
+  looper:
+    image: autoheal-patient:integration
+    environment:
+      PATIENT_GATE: /gate/looper
+    volumes:
+      - ./data:/gate
+    labels:
+      autoheal: "true"
+      autoheal.mode: "recreate"
+
+  # Labelled for recreate but never made sick: the mode is not an instruction
+  # to rebuild things that are fine.
+  well:
+    image: autoheal-patient:integration
+    labels:
+      autoheal: "true"
+      autoheal.mode: "recreate"
+
+  autoheal:
+    image: autoheal:integration
+    environment:
+      AUTOHEAL_INTERVAL: "1"
+      AUTOHEAL_START_PERIOD: "0"
+      # From .env, which the test reads too: the number it expects and the
+      # number autoheal is given must be the same one.
+      AUTOHEAL_CRASHLOOP_STRIKES: "${CRASHLOOP_STRIKES}"
+      # Recreating is not what these scenarios are timing, so do not wait ten
+      # seconds for a container that has nothing to flush.
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: "1"
+      LOG_LEVEL: debug
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${COMPOSE_BIN}:/docker-compose:ro
+      - ${PROJECT_DIR}:${PROJECT_DIR}:ro
