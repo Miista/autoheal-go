@@ -32,6 +32,22 @@ services:
       autoheal: "true"
       autoheal.mode: "restart"
 
+  # The crash-loop patient, kept separate from "sick" because its gate has to
+  # survive being rebuilt. A recreate replaces the container and its writable
+  # layer, so a gate at the default path is wiped and the patient comes back
+  # well -- which would make a crash loop look like a recovery. On a mounted
+  # volume it stays sick however many times it is rebuilt, which is what a
+  # crash loop actually is.
+  looper:
+    image: autoheal-patient:integration
+    environment:
+      PATIENT_GATE: /gate/looper
+    volumes:
+      - ./data:/gate
+    labels:
+      autoheal: "true"
+      autoheal.mode: "recreate"
+
   # Labelled for recreate but never made sick: the mode is not an instruction
   # to rebuild things that are fine.
   well:

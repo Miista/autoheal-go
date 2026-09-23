@@ -37,7 +37,21 @@ import (
 )
 
 // gatePath is inside the container, deliberately. See the package comment.
-const gatePath = "/patient.sick"
+//
+// PATIENT_GATE moves it, which the recreate scenarios need: a recreate
+// replaces the container and its writable layer with it, so a gate at the
+// default path is wiped and the patient comes back well. Pointed at a
+// mounted directory, the gate outlives a recreate the same way it already
+// outlives a restart -- and a crash loop that rebuilds the container stays a
+// crash loop rather than looking like a recovery.
+var gatePath = envOr("PATIENT_GATE", "/patient.sick")
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
 
 func main() {
 	switch {

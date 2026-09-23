@@ -131,11 +131,11 @@ func TestRecreateCrashLoopIsDetectedAcrossNewContainerIDs(t *testing.T) {
 	// .env compose read when it started the stack.
 	strikes := s.SettingInt("CRASHLOOP_STRIKES")
 
-	before := s.Container("sick")
+	before := s.Container("looper")
 
 	// Tripped and left tripped: every rebuild lands back in the same state,
 	// which is what makes this a loop rather than unrelated faults.
-	s.MakeSick("sick")
+	s.MakeSick("looper")
 
 	// Waited on by counting recreates rather than by watching for the log
 	// line this then asserts on -- sequencing on the log would mean a subject
@@ -145,9 +145,9 @@ func TestRecreateCrashLoopIsDetectedAcrossNewContainerIDs(t *testing.T) {
 	// strike transfer: reaching the threshold at all requires the count to
 	// have followed the service across every one of them.
 	seen := map[string]bool{before: true}
-	s.waitFor("autoheal to spend its allowance on sick", 180*time.Second,
+	s.waitFor("autoheal to spend its allowance on looper", 180*time.Second,
 		func() bool {
-			if id := s.Container("sick"); id != "" {
+			if id := s.Container("looper"); id != "" {
 				seen[id] = true
 			}
 			// The original plus one container per recreate.
@@ -162,9 +162,9 @@ func TestRecreateCrashLoopIsDetectedAcrossNewContainerIDs(t *testing.T) {
 
 	// Having given up, it stops: the container it last built is left standing
 	// for somebody to look at rather than being rebuilt forever.
-	settled := s.Container("sick")
+	settled := s.Container("looper")
 	time.Sleep(5 * time.Second)
-	if now := s.Container("sick"); now != settled {
+	if now := s.Container("looper"); now != settled {
 		t.Errorf("kept recreating after giving up: %s became %s\n%s",
 			settled[:12], now[:12], s.Logs("autoheal"))
 	}
