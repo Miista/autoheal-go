@@ -104,6 +104,10 @@ func getEnvInt(log zerolog.Logger, key string, def int) int {
 type dockerAPI interface {
 	listUnhealthy(cfg config) ([]containerSummary, error)
 	restart(containerID string, timeoutSeconds int) error
+	// containerID resolves a container name to its current ID. Recreating
+	// replaces the container object, so the ID autoheal was tracking is
+	// stale the moment compose returns; this is how the replacement is found.
+	containerID(name string) (string, error)
 	isHealthy(containerID string) (bool, error)
 	lastHealthOutput(containerID string) string
 }
@@ -315,6 +319,34 @@ func (d *dockerClient) restart(containerID string, timeoutSeconds int) error {
 	return nil
 }
 
+// containerID looks up a container by name. Used after a recreate, where the
+// name is the only stable handle: compose recreates a service into a new
+// container object, and with container_name pinned the name survives while the
+// ID does not.
+func (d *dockerClient) containerID(name string) (string, error) {
+	url := fmt.Sprintf("%s/containers/%s/json", d.endpoint, name)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("docker API returned %d looking up %s: %s",
+			resp.StatusCode, name, dockerErrorMessage(resp.Body))
+	}
+	var detail struct {
+		ID string `json:"Id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+		return "", err
+	}
+	return detail.ID, nil
+}
+
 // dockerErrorMessage pulls the human-readable half out of a Docker error
 // response. The daemon explains itself in the body -- {"message":"No such
 // container: ..."} -- and throwing that away left "docker API returned 500"
@@ -459,6 +491,22 @@ func runOnce(log zerolog.Logger, client dockerAPI, cfg config, strikes *strikeTr
 			timeout = n
 		}
 
+		// Same rule again: a mode nobody can read is refused rather than
+		// defaulted. Silently restarting a container whose author asked for a
+		// recreate would reproduce the exact failure the label exists to fix,
+		// and do it invisibly.
+		mode := healRestart
+		if v, ok := c.Labels["autoheal.mode"]; ok {
+			m, understood := parseHealMode(v)
+			if !understood {
+				if strikes.firstMention(c.ID, "bad-mode:"+v) {
+					log.Error().Msgf("%s has autoheal.mode=%q, which is not a mode I understand — leaving it alone until that is fixed (use restart or recreate)", name, v)
+				}
+				continue
+			}
+			mode = m
+		}
+
 		if c.State == "restarting" {
 			log.Info().Msgf("%s is already restarting, so leaving it alone this cycle", name)
 			continue
@@ -501,31 +549,76 @@ func runOnce(log zerolog.Logger, client dockerAPI, cfg config, strikes *strikeTr
 		// the thing worth putting in the alert -- is gone.
 		because := client.lastHealthOutput(c.ID)
 
-		log.Info().Msgf("%s is unhealthy — restarting it now (%ds timeout)", name, timeout)
-		if err := client.restart(c.ID, timeout); err != nil {
-			log.Error().Err(err).Msgf("Tried to restart %s but the restart itself failed", name)
+		// Both modes are a heal attempt and are counted, notified and
+		// crash-loop tracked identically below; they differ only in how the
+		// container is brought back.
+		var healErr error
+		if mode == healRecreate {
+			log.Info().Msgf("%s is unhealthy — recreating it from its compose file now", name)
+			healErr = recreate(log, name, c.Labels)
+		} else {
+			log.Info().Msgf("%s is unhealthy — restarting it now (%ds timeout)", name, timeout)
+			healErr = client.restart(c.ID, timeout)
+		}
+		if err := healErr; err != nil {
+			log.Error().Err(err).Msgf("Tried to %s %s but the attempt itself failed", mode, name)
 			// The reason travels with the alert, not just the log. Somebody
 			// reading "the restart failed" on their phone cannot go and grep,
 			// and the daemon's own message is usually the whole diagnosis
 			// ("No such container", "device or resource busy").
 			go notify(log, cfg, withHealthOutput(
-				fmt.Sprintf("%s (%s) is unhealthy and the restart attempt failed: %s", name, shortIDStr, err),
+				fmt.Sprintf("%s (%s) is unhealthy and the %s attempt failed: %s", name, shortIDStr, mode, err),
 				because))
 			continue
 		}
 
-		log.Info().Msgf("Restarted %s successfully", name)
+		// A recreate replaces the container object, so every later reference to
+		// it -- the strike count, the recovery check next cycle -- has to move
+		// to the new ID. Looked up by name because that is what survives:
+		// container_name is pinned, the ID is not.
+		//
+		// A failure here is not a failed heal. The container is recreated and
+		// running; all that is lost is the crash-loop history, so say so and
+		// carry on rather than reporting the recreate as failed.
+		healedID := c.ID
+		if mode == healRecreate {
+			newID, err := client.containerID(name)
+			if err != nil {
+				log.Warn().Err(err).Msgf("Recreated %s but couldn't find its new container ID — its crash-loop history starts over", name)
+			} else {
+				strikes.transfer(c.ID, newID)
+				healedID = newID
+			}
+		}
+
+		past := "restarted"
+		if mode == healRecreate {
+			past = "recreated"
+		}
+		log.Info().Msgf("Successfully %s %s", past, name)
 		go notify(log, cfg, withHealthOutput(
-			fmt.Sprintf("%s (%s) was unhealthy and has been restarted.", name, shortIDStr),
+			fmt.Sprintf("%s (%s) was unhealthy and has been %s.", name, shortIDStr, past),
 			because))
 		go runPostRestartScript(log, cfg, name, shortIDStr, c.State, timeout)
+
+		// The replacement inherits the old container's place in this cycle's
+		// seen set, so the recovery sweep at the end does not immediately ask
+		// whether a container recreated seconds ago is healthy yet -- it will
+		// still be in "starting", and clearing on that would wipe the history
+		// that was just carried across.
+		if healedID != c.ID {
+			seenUnhealthy[healedID] = true
+		}
 
 		// Crash-loop tracking: only increments when unhealthy AND we just
 		// restarted it — a container that's unhealthy but "restarting"
 		// (skipped above) or that fails the restart call itself doesn't
 		// count as a strike here, since we didn't successfully complete a
 		// heal attempt for it.
-		if crossed, count := strikes.recordRestart(c.ID); crossed {
+		// Keyed on healedID, not c.ID: after a recreate the strike history has
+		// just been moved there, and counting against the old ID would leave
+		// the replacement permanently at zero.
+		if crossed, count := strikes.recordRestart(healedID); crossed {
 			log.Warn().Msgf("%s has now been restarted %d times in a row without recovering — this looks like a crash loop. Giving up on further automatic restarts until it's confirmed healthy again", name, count)
 			go notify(log, cfg, fmt.Sprintf("%s (%s) has crash-looped: %d unhealthy restarts in a row with no recovery. Giving up on further automatic restarts — needs manual attention.", name, shortIDStr, count))
 		}
