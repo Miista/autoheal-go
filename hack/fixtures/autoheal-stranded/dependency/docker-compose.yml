@@ -1,0 +1,39 @@
+# A recreate that fails partway through.
+#
+# Compose stops and removes the old container, creates the new one, and only
+# then waits on its dependencies. Holding "dep" unhealthy makes that last step
+# fail, which leaves "app" created but never started: no health status, so the
+# unhealthy filter never lists it again. autoheal has to retry it anyway.
+services:
+  # Not labelled, so autoheal never touches it -- the test decides when it
+  # recovers. Its gate is on a mounted directory so it stays sick whatever
+  # happens to the container.
+  dep:
+    image: autoheal-patient:integration
+    environment:
+      PATIENT_GATE: /gate/dep
+    volumes:
+      - ./data:/gate
+
+  # Its gate is at the default path, in the writable layer, so a successful
+  # recreate brings it back well.
+  app:
+    image: autoheal-patient:integration
+    depends_on:
+      dep:
+        condition: service_healthy
+    labels:
+      autoheal: "true"
+      autoheal.mode: "recreate"
+
+  autoheal:
+    image: autoheal:integration
+    environment:
+      AUTOHEAL_INTERVAL: "1"
+      AUTOHEAL_START_PERIOD: "0"
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: "1"
+      LOG_LEVEL: debug
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${COMPOSE_BIN}:/docker-compose:ro
+      - ${PROJECT_DIR}:${PROJECT_DIR}:ro

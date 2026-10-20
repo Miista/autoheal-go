@@ -724,6 +724,7 @@ func retryStranded(log zerolog.Logger, client dockerAPI, cfg config, strikes *st
 			log.Error().Err(err).Msgf("Couldn't check on %s, which a failed recreate left down — will try again next cycle", name)
 			continue
 		}
+		log.Debug().Msgf("Checking on %s, left down by a failed recreate: found=%t state=%q", name, found, state)
 		if found {
 			id, _ := client.containerID(name)
 			// Listed as unhealthy this cycle means it is running and the
