@@ -1,6 +1,9 @@
 package main
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // strikeTracker is in-memory, deliberately not persisted to disk.
 //
@@ -43,6 +46,17 @@ type strikeTracker struct {
 	// A container paused for a twenty-minute backup is one line, not one line
 	// every AUTOHEAL_INTERVAL.
 	mentioned map[string]string
+	// stranded holds services a recreate failed partway through, keyed by
+	// container name -- see strand.
+	stranded map[string]strandedService
+}
+
+// strandedService is what it takes to try a failed recreate again: the
+// labels name the compose project, and the container that carried them may
+// no longer exist to be asked.
+type strandedService struct {
+	labels    map[string]string
+	lastTried time.Time
 }
 
 func newStrikeTracker(threshold int) *strikeTracker {
@@ -51,7 +65,47 @@ func newStrikeTracker(threshold int) *strikeTracker {
 		counts:    make(map[string]int),
 		givenUp:   make(map[string]bool),
 		mentioned: make(map[string]string),
+		stranded:  make(map[string]strandedService),
 	}
+}
+
+// strand records a service whose recreate failed, so it is tried again.
+//
+// A failed restart needs none of this: the same container is still there and
+// still unhealthy, so the next poll lists it and tries again by itself. A
+// failed recreate is different. Compose stops and removes the old container
+// before it creates and starts the new one, so a failure in the second half
+// leaves a container in "created" (or nothing at all), with no health status
+// to match the unhealthy filter. Nothing would ever list it again, and the
+// service would stay down with autoheal unaware of it -- which is how
+// qbittorrent sat in "created" for hours after its VPN dependency was
+// unhealthy at the moment of the recreate.
+//
+// Keyed by name, because that is the only handle that survives a recreate.
+func (s *strikeTracker) strand(name string, labels map[string]string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stranded[name] = strandedService{labels: labels, lastTried: at}
+}
+
+// unstrand forgets a stranded service, once it is running again by any means.
+func (s *strikeTracker) unstrand(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.stranded, name)
+	delete(s.mentioned, "stranded:"+name)
+}
+
+// strandedServices returns a copy of the stranded set, so the caller can
+// retry each one without holding the lock across a compose run.
+func (s *strikeTracker) strandedServices() map[string]strandedService {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]strandedService, len(s.stranded))
+	for name, svc := range s.stranded {
+		out[name] = svc
+	}
+	return out
 }
 
 // firstMention reports whether this is the first cycle a container has been

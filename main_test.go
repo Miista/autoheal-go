@@ -31,6 +31,15 @@ type fakeDockerAPI struct {
 	// is the "recreated but couldn't find the new ID" path.
 	newIDs   map[string]string
 	lookedUp []string // container names passed to containerID(), in call order
+
+	// states maps a container name to what containerState reports. Unset
+	// means no such container.
+	states map[string]string
+}
+
+func (f *fakeDockerAPI) containerState(name string) (string, bool, error) {
+	s, ok := f.states[name]
+	return s, ok, nil
 }
 
 func newFakeDockerAPI() *fakeDockerAPI {
@@ -40,6 +49,7 @@ func newFakeDockerAPI() *fakeDockerAPI {
 		healthErr:    map[string]error{},
 		healthOutput: map[string]string{},
 		newIDs:       map[string]string{},
+		states:       map[string]string{},
 	}
 }
 
