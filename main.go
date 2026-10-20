@@ -108,6 +108,10 @@ type dockerAPI interface {
 	// replaces the container object, so the ID autoheal was tracking is
 	// stale the moment compose returns; this is how the replacement is found.
 	containerID(name string) (string, error)
+	// containerState reports a container's state ("running", "created", ...)
+	// by name, with found false if there is no such container. Used to check
+	// on services a failed recreate left behind -- see strikeTracker.strand.
+	containerState(name string) (state string, found bool, err error)
 	isHealthy(containerID string) (bool, error)
 	lastHealthOutput(containerID string) string
 }
@@ -347,6 +351,38 @@ func (d *dockerClient) containerID(name string) (string, error) {
 	return detail.ID, nil
 }
 
+// containerState looks up a container's state by name. A 404 is an answer,
+// not an error: a recreate can fail after the old container is removed and
+// before the new one exists.
+func (d *dockerClient) containerState(name string) (string, bool, error) {
+	url := fmt.Sprintf("%s/containers/%s/json", d.endpoint, name)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return "", false, err
+	}
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return "", false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return "", false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", false, fmt.Errorf("docker API returned %d looking up %s: %s",
+			resp.StatusCode, name, dockerErrorMessage(resp.Body))
+	}
+	var detail struct {
+		State struct {
+			Status string `json:"Status"`
+		} `json:"State"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+		return "", false, err
+	}
+	return detail.State.Status, true, nil
+}
+
 // dockerErrorMessage pulls the human-readable half out of a Docker error
 // response. The daemon explains itself in the body -- {"message":"No such
 // container: ..."} -- and throwing that away left "docker API returned 500"
@@ -555,7 +591,12 @@ func runOnce(log zerolog.Logger, client dockerAPI, cfg config, strikes *strikeTr
 		var healErr error
 		if mode == healRecreate {
 			log.Info().Msgf("%s is unhealthy — recreating it from its compose file now", name)
-			healErr = recreate(log, name, c.Labels)
+			healErr = recreateService(log, name, c.Labels)
+			if healErr != nil {
+				strikes.strand(name, c.Labels, now())
+			} else {
+				strikes.unstrand(name)
+			}
 		} else {
 			log.Info().Msgf("%s is unhealthy — restarting it now (%ds timeout)", name, timeout)
 			healErr = client.restart(c.ID, timeout)
@@ -624,6 +665,8 @@ func runOnce(log zerolog.Logger, client dockerAPI, cfg config, strikes *strikeTr
 		}
 	}
 
+	retryStranded(log, client, cfg, strikes, seenUnhealthy)
+
 	// Clear strikes only for tracked containers confirmed genuinely
 	// healthy, not merely absent from the unhealthy-filtered list — a
 	// restarting container passes through Docker's "starting" health state
@@ -645,6 +688,80 @@ func runOnce(log zerolog.Logger, client dockerAPI, cfg config, strikes *strikeTr
 			log.Info().Msgf("%s is healthy again — clearing its crash-loop history", shortID(id))
 			strikes.clear(id)
 		}
+	}
+}
+
+// recreateService and now are seams for tests: the real recreate needs a
+// compose binary and a project on disk, and the retry pacing needs a clock.
+var (
+	recreateService = recreate
+	now             = time.Now
+)
+
+// strandedRetryEvery paces retries of a failed recreate. Every poll would be
+// every five seconds by default, and each attempt is a full compose run that
+// may sit waiting on a dependency's health; the thing that made the recreate
+// fail (usually that dependency) does not recover on that timescale.
+const strandedRetryEvery = 30 * time.Second
+
+// retryStranded tries again to recreate the services a failed recreate left
+// down -- see strikeTracker.strand for why the unhealthy filter cannot find
+// them by itself.
+//
+// One that is running again, by our hand or anyone else's, is forgotten. One
+// that is restarting or paused is somebody else's business for now and left
+// alone. Anything else -- created, exited, dead, or gone entirely -- is
+// recreated again.
+//
+// These retries do not count as strikes. The crash-loop count is about a
+// container that comes up and fails its healthcheck; a stranded one never got
+// far enough to have one, and counting would give up on a service that is
+// only waiting for its dependency to come back.
+func retryStranded(log zerolog.Logger, client dockerAPI, cfg config, strikes *strikeTracker, seenUnhealthy map[string]bool) {
+	for name, svc := range strikes.strandedServices() {
+		state, found, err := client.containerState(name)
+		if err != nil {
+			log.Error().Err(err).Msgf("Couldn't check on %s, which a failed recreate left down — will try again next cycle", name)
+			continue
+		}
+		if found {
+			id, _ := client.containerID(name)
+			// Listed as unhealthy this cycle means it is running and the
+			// normal path has it; that path also re-strands it if the
+			// recreate it just tried failed again.
+			if seenUnhealthy[id] {
+				continue
+			}
+			switch state {
+			case "running":
+				log.Info().Msgf("%s is running again — no longer retrying its recreate", name)
+				strikes.unstrand(name)
+				continue
+			case "restarting", "paused":
+				continue
+			}
+		}
+		if now().Sub(svc.lastTried) < strandedRetryEvery {
+			continue
+		}
+
+		what := "missing"
+		if found {
+			what = "in state " + state
+		}
+		err = recreateService(log, name, svc.labels)
+		if err != nil {
+			strikes.strand(name, svc.labels, now())
+			// Logged when the reason changes, not every attempt: a dependency
+			// that is down for an hour would otherwise be 120 identical lines.
+			if strikes.firstMention("stranded:"+name, err.Error()) {
+				log.Error().Err(err).Msgf("%s is still down (%s) after a failed recreate, and trying again failed — will keep trying every %s", name, what, strandedRetryEvery)
+			}
+			continue
+		}
+		strikes.unstrand(name)
+		log.Info().Msgf("Successfully recreated %s, which a failed recreate had left %s", name, what)
+		go notify(log, cfg, fmt.Sprintf("%s was left %s by a failed recreate and has now been recreated.", name, what))
 	}
 }
 

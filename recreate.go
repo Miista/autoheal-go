@@ -92,17 +92,26 @@ func recreate(log zerolog.Logger, name string, labels map[string]string) error {
 		return fmt.Errorf("compose took longer than %s to recreate %s and was killed", recreateTimeout, name)
 	}
 	if err != nil {
-		return fmt.Errorf("compose failed to recreate %s: %w: %s", name, err, firstLine(string(output)))
+		// The whole output goes to the log, because the alert can only carry
+		// one line and that line is not always the whole story.
+		log.Error().Msgf("compose output while recreating %s:\n%s", name, strings.TrimSpace(string(output)))
+		return fmt.Errorf("compose failed to recreate %s: %w: %s", name, err, lastLine(string(output)))
 	}
 	return nil
 }
 
-// firstLine trims command output down to something an alert can carry, the
-// same way summarizeHealthOutput does for healthcheck output: compose reports
-// a failure over several lines and the first is the diagnosis.
-func firstLine(s string) string {
-	for _, line := range strings.Split(s, "\n") {
-		if line = strings.TrimSpace(line); line != "" {
+// lastLine trims command output down to something an alert can carry, the
+// same way summarizeHealthOutput does for healthcheck output.
+//
+// The last line, not the first: compose prints its progress ("Container
+// gluetun Running", "Container gluetun Waiting") before it gets anywhere near
+// failing, and the error comes at the end. Taking the first line once turned
+// "dependency failed to start" into an alert that just said gluetun was
+// running.
+func lastLine(s string) string {
+	lines := strings.Split(s, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if line := strings.TrimSpace(lines[i]); line != "" {
 			if len(line) > 200 {
 				return line[:200]
 			}

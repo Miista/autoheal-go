@@ -144,14 +144,17 @@ func TestRecreateRefusesWithoutPreconditions(t *testing.T) {
 	}
 }
 
-func TestFirstLine(t *testing.T) {
-	if got := firstLine("\n\n  boom  \nsecond line\n"); got != "boom" {
+func TestLastLine(t *testing.T) {
+	// The shape of the real failure: progress first, the diagnosis last.
+	out := " Container gluetun Running \n Container gluetun Waiting \n" +
+		"dependency failed to start: container gluetun is unhealthy\n\n"
+	if got := lastLine(out); got != "dependency failed to start: container gluetun is unhealthy" {
 		t.Errorf("got %q", got)
 	}
-	if got := firstLine(""); got != "no output" {
+	if got := lastLine(""); got != "no output" {
 		t.Errorf("empty: got %q", got)
 	}
-	if got := firstLine(strings.Repeat("x", 500)); len(got) != 200 {
+	if got := lastLine(strings.Repeat("x", 500)); len(got) != 200 {
 		t.Errorf("long line not trimmed: %d chars", len(got))
 	}
 }
