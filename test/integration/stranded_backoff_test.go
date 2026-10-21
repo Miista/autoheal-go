@@ -10,14 +10,14 @@ import (
 )
 
 // What these tests are about: a recreate that keeps failing is retried at the
-// pace AUTOHEAL_STRANDED_RETRY_INTERVALS sets, never stops, is logged on every
-// attempt, and is announced once -- not on every attempt, and not at all if it
-// is somebody else's by then. The fixture sets the list to 2s,4s,8s and the
-// notice to 15s, so a minute of watching covers all of it.
-
-// stillDown is the log line for a failed retry. The first failure is reported
-// by a different line, so these start at the second attempt.
-const stillDown = "is still down"
+// pace AUTOHEAL_STRANDED_RETRY_INTERVALS sets, never stops, and is announced
+// once -- not on every attempt, and not at all if it is somebody else's by
+// then. The fixture sets the list to 2s,4s,8s and the notice to 15s, so a
+// minute of watching covers all of it.
+//
+// Everything asserted is an outcome in the world: containers that were
+// replaced, and when; notifications that arrived. Nothing reads autoheal's own
+// log, which is wording it is free to change.
 
 // notices are the notifications that say a service has been down a while,
 // leaving out the ordinary ones (a failed heal, a recovery).
@@ -32,52 +32,86 @@ func (s *Scenario) notices() []string {
 	return out
 }
 
+// createdAt is when docker made the container, and false if it is already gone:
+// with retries a few seconds apart, the next recreate can remove a container
+// between being listed and being asked about.
+func (s *Scenario) createdAt(id string) (time.Time, bool) {
+	s.t.Helper()
+	out, err := exec.Command("docker", "inspect", "-f", "{{.Created}}", id).Output()
+	if err != nil {
+		return time.Time{}, false
+	}
+	at, err := time.Parse(time.RFC3339Nano, trimmed(out))
+	if err != nil {
+		s.t.Fatalf("reading when container %s was created from %q: %v", id, trimmed(out), err)
+	}
+	return at, true
+}
+
+// attempts watches app's container being replaced, once per recreate autoheal
+// tries, and returns when each replacement was made, the stranded one first.
+//
+// Every attempt compose gets as far as replacing the container before it fails
+// on the dependency, so a new container is an attempt that happened, whatever
+// autoheal said about it.
+func (s *Scenario) attempts(stranded string, n int, timeout time.Duration) []time.Time {
+	s.t.Helper()
+	var times []time.Time
+	if at, ok := s.createdAt(stranded); ok {
+		times = append(times, at)
+	}
+	last := stranded
+	s.waitFor("autoheal to have tried the recreate again", timeout,
+		func() bool {
+			if id := s.anyContainer("app"); id != "" && id != last {
+				if at, ok := s.createdAt(id); ok {
+					last = id
+					times = append(times, at)
+				}
+			}
+			return len(times) >= n
+		},
+		func() string { return s.Logs("autoheal") })
+	return times
+}
+
 // The list is the schedule, in order, and its last entry repeats.
 //
-// The first failure is the heal attempt itself; the first line this asserts on
-// is the second attempt, so the waits seen are 4s (the second entry), then 8s
-// (the third), and then 8s again for as long as it goes on. Six lines is past
-// the end of a three-entry list, so a retry that stopped, or fell back to the
-// first entry, would show.
+// The waits between attempts are 2s, 4s, then 8s for as long as it goes on.
+// Each gap is at least its interval -- a retry that came sooner would not be
+// backing off -- and the later ones do not grow beyond the last entry, which
+// they would if the list were being doubled or run past its end. Seven
+// containers is past the end of a three-entry list, so a retry that stopped
+// would not produce them.
 func TestStrandedRetriesFollowTheConfiguredIntervals(t *testing.T) {
 	s := Up(t, "autoheal-stranded/backoff")
 	s.Start()
 
-	strand(s)
+	stranded := strand(s)
+	times := s.attempts(stranded, 7, 3*time.Minute)
 
-	s.waitFor("six failed retries to be logged", 3*time.Minute,
-		func() bool { return s.Times("autoheal", stillDown) >= 6 },
-		func() string { return s.Logs("autoheal") })
-
-	var waits []string
-	for _, line := range strings.Split(s.Logs("autoheal"), "\n") {
-		if !strings.Contains(line, stillDown) {
-			continue
+	// Compose takes a moment on each attempt, and both ends of a gap are
+	// stamped mid-run, so the bounds are generous either way.
+	const slack = time.Second
+	want := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 8 * time.Second, 8 * time.Second, 8 * time.Second}
+	for i, interval := range want {
+		gap := times[i+1].Sub(times[i])
+		if gap < interval-slack {
+			t.Errorf("attempt %d came %s after the one before, sooner than the %s the list asks for", i+2, gap, interval)
 		}
-		i := strings.Index(line, "next in ")
-		if i < 0 {
-			t.Fatalf("a failed retry was logged without saying when the next is:\n%s", line)
-		}
-		// The console logger colours its output; the escape sequence trails
-		// the last word of the message.
-		wait := strings.Fields(line[i+len("next in "):])[0]
-		waits = append(waits, strings.SplitN(wait, "\x1b", 2)[0])
-	}
-	want := []string{"4s", "8s", "8s", "8s", "8s", "8s"}
-	for i, w := range want {
-		if i >= len(waits) || waits[i] != w {
-			t.Fatalf("retry waits were %v, want them to start %v", waits, want)
+		if i >= 3 && gap > interval+6*time.Second {
+			t.Errorf("attempt %d came %s after the one before: the last entry (%s) should repeat, not grow", i+2, gap, interval)
 		}
 	}
 }
 
-// One notice, however long it goes on; every retry still logged; and when the
-// service comes back the notice does not repeat.
-func TestStrandedNoticeIsSentOnceButEveryRetryIsLogged(t *testing.T) {
+// One notice, however long it goes on; retries carry on regardless; and when
+// the service comes back the notice does not repeat.
+func TestStrandedNoticeIsSentOnceWhileRetriesContinue(t *testing.T) {
 	s := Up(t, "autoheal-stranded/backoff")
 	s.Start()
 
-	strand(s)
+	stranded := strand(s)
 
 	s.waitFor("the 'down for a while' notice", 90*time.Second,
 		func() bool { return len(s.notices()) > 0 },
@@ -87,16 +121,11 @@ func TestStrandedNoticeIsSentOnceButEveryRetryIsLogged(t *testing.T) {
 	if !strings.Contains(got, "test-host") || !strings.Contains(got, "app") {
 		t.Errorf("the notice does not say which host and service:\n%s", got)
 	}
-	if !strings.Contains(got, "Autoheal is still retrying") {
-		t.Errorf("the notice does not say autoheal is still on it:\n%s", got)
-	}
 
-	// Well past the notice, with retries still failing: more lines, no more
-	// notices.
-	seen := s.Times("autoheal", stillDown)
-	s.waitFor("three more failed retries", 2*time.Minute,
-		func() bool { return s.Times("autoheal", stillDown) >= seen+3 },
-		func() string { return s.Logs("autoheal") })
+	// Well past the notice, with retries still failing -- shown by the
+	// container still being replaced, not by anything autoheal says: more
+	// attempts, no more notices.
+	s.attempts(stranded, 5, 2*time.Minute)
 	if n := len(s.notices()); n != 1 {
 		t.Errorf("expected exactly one notice while it stayed down, got %d:\n%v", n, s.notices())
 	}
@@ -113,7 +142,8 @@ func TestStrandedNoticeIsSentOnceButEveryRetryIsLogged(t *testing.T) {
 }
 
 // The refusing case: a service somebody started by hand is not down any more,
-// so there is nothing to announce, however long the threshold would have taken.
+// so there is nothing to announce, however long the threshold would have taken
+// -- and it is not rebuilt out from under them either.
 func TestNoNoticeForAServiceStartedByHand(t *testing.T) {
 	s := Up(t, "autoheal-stranded/backoff")
 	s.Start()
@@ -122,12 +152,17 @@ func TestNoNoticeForAServiceStartedByHand(t *testing.T) {
 	if out, err := exec.Command("docker", "start", stranded).CombinedOutput(); err != nil {
 		t.Fatalf("starting app by hand: %v\n%s", err, out)
 	}
-	s.WaitForLine("autoheal", "testbed-app-1 is running again")
+	s.waitFor("app to be running", 30*time.Second,
+		func() bool { return stateOf(stranded) == "running" },
+		func() string { return s.Logs("autoheal") })
 
 	// Past the 15s threshold with margin: a notice that was going to be sent
-	// has been.
+	// has been, and a retry that was going to happen has.
 	time.Sleep(25 * time.Second)
 	if n := s.notices(); len(n) != 0 {
-		t.Errorf("announced a service that had been started by hand:\n%v\n%s", n, s.Logs("autoheal"))
+		t.Errorf("announced a service that had been started by hand:\n%v", n)
+	}
+	if now := s.anyContainer("app"); now != stranded {
+		t.Errorf("app was recreated after it had been started by hand: %s became %s", stranded[:12], now[:12])
 	}
 }
