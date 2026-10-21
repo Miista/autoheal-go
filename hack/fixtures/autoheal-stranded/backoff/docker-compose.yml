@@ -1,0 +1,47 @@
+# A recreate that keeps failing, with the retry pacing and the notice turned
+# down to seconds so a test can watch them.
+#
+# Same trap as ../dependency: holding "dep" unhealthy makes app's recreate fail
+# after compose has already replaced it. What differs is autoheal's settings --
+# a short list of retry intervals whose last entry must repeat -- and a
+# receiver, so the one notification can be read from the other side.
+services:
+  dep:
+    image: autoheal-patient:integration
+    environment:
+      PATIENT_GATE: /gate/dep
+    volumes:
+      # Also where the receiver writes requests.log (see Scenario.Notifications),
+      # so the gate and the notification log share one directory.
+      - ./data:/gate
+
+  app:
+    image: autoheal-patient:integration
+    depends_on:
+      dep:
+        condition: service_healthy
+    labels:
+      autoheal: "true"
+      autoheal.mode: "recreate"
+
+  receiver:
+    image: autoheal-receiver:integration
+    volumes:
+      - ./data:/log
+
+  autoheal:
+    image: autoheal:integration
+    environment:
+      AUTOHEAL_INTERVAL: "1"
+      AUTOHEAL_START_PERIOD: "0"
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: "1"
+      AUTOHEAL_NOTIFY_PREFIX: "test-host"
+      AUTOHEAL_STRANDED_RETRY_INTERVALS: "2s,4s,8s"
+      AUTOHEAL_STRANDED_NOTIFY_AFTER: "15s"
+      WEBHOOK_URL: "http://receiver:8080/"
+      WEBHOOK_JSON_KEY: "text"
+      LOG_LEVEL: debug
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${COMPOSE_BIN}:/docker-compose:ro
+      - ${PROJECT_DIR}:${PROJECT_DIR}:ro

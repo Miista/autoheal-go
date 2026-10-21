@@ -32,6 +32,8 @@ New in this rewrite:
 | Variable | Default | Notes |
 |---|---|---|
 | `AUTOHEAL_CRASHLOOP_STRIKES` | `3` | Consecutive restarts without recovery before giving up and alerting once. |
+| `AUTOHEAL_STRANDED_RETRY_INTERVALS` | `30s,1m,2m` | How long to wait before each retry of a recreate that failed partway (usually: its dependency was unhealthy). Comma-separated durations; the first is the wait after the first failure, the second after the second, and the **last repeats for as long as it takes**. Retries never stop and are never strikes. An unreadable list is ignored with a warning. |
+| `AUTOHEAL_STRANDED_NOTIFY_AFTER` | `5m` | How long a service must stay down after failed recreates before one notification says so. Sent once per stranding; every failed retry is logged regardless. |
 | `LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error`. |
 | `TZ` | unset (UTC) | IANA zone name, e.g. `Europe/Stockholm`, for local log timestamps. |
 | `NTFY_URL` | unset | Full [ntfy](https://ntfy.sh) topic URL, e.g. `https://ntfy.sh/mytopic`. Sends a plain-text message, not JSON. |

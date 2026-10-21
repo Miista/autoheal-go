@@ -53,6 +53,18 @@ type config struct {
 	DefaultStopTimeout       int
 	OnlyMonitorRunning       bool
 	CrashLoopStrikeThreshold int
+	// StrandedRetryIntervals and StrandedNotifyAfter govern a recreate that
+	// failed partway; see defaultStrandedIntervals. Zero values mean the
+	// defaults, so a config built by hand in a test need not set them.
+	StrandedRetryIntervals []time.Duration
+	StrandedNotifyAfter    time.Duration
+}
+
+func (c config) strandedNotifyAfter() time.Duration {
+	if c.StrandedNotifyAfter <= 0 {
+		return defaultStrandedNotifyAfter
+	}
+	return c.StrandedNotifyAfter
 }
 
 func loadConfig(log zerolog.Logger) config {
@@ -72,6 +84,8 @@ func loadConfig(log zerolog.Logger) config {
 		DefaultStopTimeout:       getEnvInt(log, "AUTOHEAL_DEFAULT_STOP_TIMEOUT", 10),
 		OnlyMonitorRunning:       getEnv("AUTOHEAL_ONLY_MONITOR_RUNNING", "false") == "true",
 		CrashLoopStrikeThreshold: getEnvInt(log, "AUTOHEAL_CRASHLOOP_STRIKES", 3),
+		StrandedRetryIntervals:   getEnvIntervals(log, "AUTOHEAL_STRANDED_RETRY_INTERVALS", defaultStrandedIntervals),
+		StrandedNotifyAfter:      getEnvDuration(log, "AUTOHEAL_STRANDED_NOTIFY_AFTER", defaultStrandedNotifyAfter),
 	}
 }
 
@@ -698,11 +712,83 @@ var (
 	now             = time.Now
 )
 
-// strandedRetryEvery paces retries of a failed recreate. Every poll would be
-// every five seconds by default, and each attempt is a full compose run that
+// defaultStrandedIntervals paces retries of a failed recreate. Every poll would
+// be every five seconds by default, and each attempt is a full compose run that
 // may sit waiting on a dependency's health; the thing that made the recreate
 // fail (usually that dependency) does not recover on that timescale.
-const strandedRetryEvery = 30 * time.Second
+//
+// Retries slow down the longer a recreate keeps failing, but never stop: what
+// eventually brings a service back after its dependency does is one more
+// attempt. So the list is how long to wait after the first failure, the
+// second, and so on, and the last entry repeats for as long as it takes.
+// (Hence no strikes either -- see retryStranded.)
+var defaultStrandedIntervals = []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute}
+
+// defaultStrandedNotifyAfter is how long a service must stay stranded before
+// one notification says so. Shorter than that is a dependency restarting,
+// which the recovery notice already covers.
+const defaultStrandedNotifyAfter = 5 * time.Minute
+
+// retryAfter is the wait before the next retry once attempts recreates have
+// failed: the attempts'th interval, or the last one once the list runs out.
+func retryAfter(intervals []time.Duration, attempts int) time.Duration {
+	if len(intervals) == 0 {
+		intervals = defaultStrandedIntervals
+	}
+	i := attempts - 1
+	if i < 0 {
+		i = 0
+	}
+	if i >= len(intervals) {
+		i = len(intervals) - 1
+	}
+	return intervals[i]
+}
+
+// parseIntervals reads a comma-separated list of durations such as
+// "30s,1m,2m". Anything unreadable, empty or not positive is an error rather
+// than a quietly shortened list: a retry interval of zero would be a busy loop.
+func parseIntervals(raw string) ([]time.Duration, error) {
+	var out []time.Duration
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		d, err := time.ParseDuration(part)
+		if err != nil {
+			return nil, fmt.Errorf("%q is not a duration", part)
+		}
+		if d <= 0 {
+			return nil, fmt.Errorf("%q is not positive", part)
+		}
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+func getEnvIntervals(log zerolog.Logger, key string, def []time.Duration) []time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	out, err := parseIntervals(v)
+	if err != nil {
+		log.Warn().Msgf("invalid intervals for %s=%q (%v), using default %v", key, v, err, def)
+		return def
+	}
+	return out
+}
+
+func getEnvDuration(log zerolog.Logger, key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		log.Warn().Msgf("invalid duration for %s=%q, using default %s", key, v, def)
+		return def
+	}
+	return d
+}
 
 // retryStranded tries again to recreate the services a failed recreate left
 // down -- see strikeTracker.strand for why the unhealthy filter cannot find
@@ -742,7 +828,14 @@ func retryStranded(log zerolog.Logger, client dockerAPI, cfg config, strikes *st
 				continue
 			}
 		}
-		if now().Sub(svc.lastTried) < strandedRetryEvery {
+		// Said once per stranding, and only while it is still down: a service
+		// that is running, restarting or paused was skipped above.
+		if due, ok := strikes.dueStrandedNotice(name, now(), cfg.strandedNotifyAfter()); ok {
+			down := now().Sub(due.since).Round(time.Second)
+			log.Warn().Msgf("%s has been down for %s across %d failed recreates — still retrying, no more notices about it until it recovers", name, down, due.attempts)
+			go notify(log, cfg, fmt.Sprintf("%s has been down for %s after %d failed recreates. Autoheal is still retrying.", name, down, due.attempts))
+		}
+		if now().Sub(svc.lastTried) < retryAfter(cfg.StrandedRetryIntervals, svc.attempts) {
 			continue
 		}
 
@@ -752,12 +845,13 @@ func retryStranded(log zerolog.Logger, client dockerAPI, cfg config, strikes *st
 		}
 		err = recreateService(log, name, svc.labels)
 		if err != nil {
-			strikes.strand(name, svc.labels, now())
-			// Logged when the reason changes, not every attempt: a dependency
-			// that is down for an hour would otherwise be 120 identical lines.
-			if strikes.firstMention("stranded:"+name, err.Error()) {
-				log.Error().Err(err).Msgf("%s is still down (%s) after a failed recreate, and trying again failed — will keep trying every %s", name, what, strandedRetryEvery)
-			}
+			at := now()
+			strikes.strand(name, svc.labels, at)
+			// Logged every attempt, though only the first notice is sent: the
+			// log is where the whole history of an outage is read back, and
+			// backing off keeps it to a few lines a minute.
+			attempts := svc.attempts + 1
+			log.Error().Err(err).Msgf("%s is still down (%s) after %d failed recreates over %s — will keep trying, next in %s", name, what, attempts, at.Sub(svc.since).Round(time.Second), retryAfter(cfg.StrandedRetryIntervals, attempts))
 			continue
 		}
 		strikes.unstrand(name)

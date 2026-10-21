@@ -57,6 +57,13 @@ type strikeTracker struct {
 type strandedService struct {
 	labels    map[string]string
 	lastTried time.Time
+	// attempts counts the failed recreates so far, paces the next retry (see
+	// strandedRetryAfter), and since marks when the first one failed, so a
+	// long outage can be told apart from a blip. Both belong to one stranding:
+	// unstrand drops them with the entry, so the next one starts over.
+	attempts int
+	since    time.Time
+	notified bool
 }
 
 func newStrikeTracker(threshold int) *strikeTracker {
@@ -85,7 +92,29 @@ func newStrikeTracker(threshold int) *strikeTracker {
 func (s *strikeTracker) strand(name string, labels map[string]string, at time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.stranded[name] = strandedService{labels: labels, lastTried: at}
+	svc, again := s.stranded[name]
+	if !again {
+		svc = strandedService{since: at}
+	}
+	svc.labels, svc.lastTried = labels, at
+	svc.attempts++
+	s.stranded[name] = svc
+}
+
+// dueStrandedNotice reports whether this stranding has lasted long enough to
+// be worth telling a human about, and records that it has been told so it
+// is said once per stranding, not on every retry. A recovery clears the
+// record, so a later, separate stranding earns its own notice.
+func (s *strikeTracker) dueStrandedNotice(name string, at time.Time, after time.Duration) (strandedService, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	svc, ok := s.stranded[name]
+	if !ok || svc.notified || at.Sub(svc.since) < after {
+		return svc, false
+	}
+	svc.notified = true
+	s.stranded[name] = svc
+	return svc, true
 }
 
 // unstrand forgets a stranded service, once it is running again by any means.
